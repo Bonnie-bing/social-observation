@@ -1,0 +1,1420 @@
+---
+title: "Learning_model"
+author: "Chunliang Feng (SCNU)"
+date: June, 22, 2022
+output:
+  html_document:
+    code_folding: hide
+---
+```{r setup, include=FALSE}
+#rm(list=ls())
+require("knitr") 
+opts_chunk$set(tidy = FALSE, warning = FALSE, message = FALSE, cache = FALSE)
+
+#load libraries and functions
+suppressMessages(library("tidyverse")) # to organize data
+suppressMessages(library('rstan')) # for model fiting, using the sampling function
+rstan_options(auto_write = TRUE) #which allows you to automatically save a bare version of a compiled Stan program to the hard disk so that it does not need to be recompiled (unless you change it): https://github.com/stan-dev/rstan/wiki/RStan-Getting-Started
+suppressMessages(library('loo'))   # for calculating looic and waic
+suppressMessages(library("data.table")) # to read data as data.table rather than data.frame.
+suppressMessages(library("bayesplot")) # to plot various figures for model checking
+suppressMessages(library("R.matlab")) # to save out .mat files
+suppressMessages(library("hypr")) # transfer hypothesis matrix to contrast matrix.
+
+
+#The following functions are adapted from the hBayesDM package (Ahn et al., 2017).
+source("./supp_funcs/func01_prepro.R") #preparing the data for the stan:                         change for each project
+source("./supp_funcs/func04_extract_ic.R") #extract looic and waic of the model:                 no chnage needed
+source("./supp_funcs/func05_printfit.R") #print looic and waic of the model and their weights:   no change needed
+source("./supp_funcs/estimate_mode.R") #estimate the mode (众数) of the posterior distribution:  no change needed
+
+options(max.print = 99999) # for ploting all results of fitted model
+```
+
+1. load the csv data.
+```{r}
+raw_data                     <- fread(file="all_data.csv") #load as data.table: https://digitaschools.com/read-csv-in-r-importing-data/
+data_df                      <- raw_data
+```
+
+2. data describing.
+```{r}
+# 1. Target variable:      choice (1 or 2). (we want our models to accurately predict participants' choice on each trial as much as possible)
+# 2. Predictor variable:   (1) feedback (0 or 1) of previous trial. According to the RL, we expect participants learn the stimulus-response association based on feedback; (2) choice history/decision inertia: how many times the current choice has been previously chosen; (3) working memory: delay between stimulus repetitions.
+# 3. supporting variables: subid (2301~2347), block (1~5), trial_perC (1~25), cond (1~6), delay (0~45)
+```
+
+3. data cleaning
+```{r}
+#0. left only alone participants
+data_df <- data_df %>% filter(appearance==0) #including alone participants
+
+#1. only left the necessary variables
+data_df <- data_df[,c('subid','block','trial_perC','cond','feedback','choice','delay','ACC')]
+
+#2. removing NaNs
+data_df <- data_df %>% filter(!is.nan(choice)) #excluding non-response trials, we can only exclude trials with this.
+#data_df <- data_df %>% filter(!is.nan(delay)) #excluding first trial of each pic in each block: we should not do this.
+
+#3. convert feedback to -1 (wrong) and 1 (correct)
+data_df$feedback <- ifelse(data_df$feedback == 0, -1, 1) # change the initial ev in the stan files accordingly!!!
+
+#4. convert trial_perC, ignoring the trial number of non-responded trials.
+data_df <- data_df %>% 
+  group_by(subid,block,cond) %>% 
+  mutate(trial_perC2 = 1:n()) #ignoring the missed trials
+
+#5. convert condition (1~6) to probability (1~3)
+data_df <- data_df %>% 
+  mutate(probab = case_when( cond %in% c(1,2) ~ 1,
+                           cond %in% c(3,4) ~ 2,
+                           cond %in% c(5,6) ~ 3)) # probability 
+
+#data_for_cm_all <- data_df[,c('subid','block','cond','feedback','choice','trial_perC2','probab','delay')]
+#write.csv(data_for_cm_all,file='data_for_cm_all.csv',row.names = FALSE)
+
+data_df <- as.data.table(data_df)
+class(data_df)
+```
+
+
+
+4. preparing data for stan
+```{r data loading}
+
+colnames_data_df <- colnames(data_df)
+
+subjs    <- NULL   # List of unique subjects (1D)
+n_subj   <- NULL   # Total number of subjects (0D)
+b_subjs  <- NULL   # number of blocks for each sub
+b_max    <- NULL   # maximum number of blocks across subjects
+t_subjs  <- NULL   # Number of trials per block per subject (2D or 1D)
+t_max    <- NULL   # Maximum number of trials across all blocks & subjects (0D)
+
+.N       <- NULL
+subjid   <- NULL
+
+DT_trials <- data_df[, .N, by = c("subid", "block")] #get the number of trials for each sub and each block, data.table
+DT_blocks <- DT_trials[, .N, by = "subid"] # get the number of blocks for each sub, data.table
+
+subjs     <- DT_blocks$subid    # sub IDs
+n_subj    <- length(subjs)      # no. of subs
+b_subjs   <- DT_blocks$N        # block numbers
+b_max     <- max(b_subjs)       # maximal number of blocks
+t_subjs   <- array(0, c(n_subj, b_max)) # trial number for each sub and block
+for (i in 1:n_subj) {
+  subj <- subjs[i]  # current sub
+  b <- b_subjs[i]   # no. of blocks for the current sub.
+  t_subjs[i, 1:b] <- DT_trials[subid == subj]$N # no. of trials for all blocks of the current sub
+}
+t_max     <- max(t_subjs) # maximal no. of trials across all blocks and subs.
+
+gen_file <- 1 #whether or not generate a data file, only generating for main analysis
+
+general_info        <- list(subjs, n_subj, b_subjs, b_max, t_subjs, t_max,gen_file)
+names(general_info) <- c("subjs", "n_subj", "b_subjs", "b_max", "t_subjs", "t_max","gen_file")
+
+data_list <- prepro_func(data_df,general_info)  # get the data ready for stan
+
+```
+
+
+5.1 set up model 1, m1_rw
+```{r set up model 1}
+ncore <- 3
+options(mc.cores = ncore) #adapted from hBayesDM_model.R
+rstan_options(javascript=FALSE) # see also: https://discourse.mc-stan.org/t/error-in-open-connection-con-open-mode-timeout-was-reached-github-com/23162/6
+
+#model 1, the RW model, two parameters: eta and tau
+pars_m1 <- c('mu_eta','mu_tau','sigma','eta','tau','log_lik')
+fit_m1 <- stan(file=paste0(getwd(),'/m1_rw.stan'), data=data_list,
+                             pars    = pars_m1,
+                             chains  = 3,
+                             iter    = 4000,
+                             warmup  = 2000,
+                             thin    = 1,
+                             control = list(adapt_delta   = 0.95,
+                                            stepsize      = 1,
+                                            max_treedepth = 10))
+
+#################################################################model fit & save model & plots#############################################################
+save(fit_m1,file='fit_m1.RData')
+printFit(fit_m1,ic="both")
+print(fit_m1, pars = c("mu_eta", "mu_tau",'sigma')) #all are group-level parameters
+
+#plot group parameters
+stan_dens(fit_m1, pars = paste0(c("mu_eta", "mu_tau",'sigma[1]','sigma[2]')), separate_chains = T) #should overlap to each other
+#plot individual parameters
+stan_plot(fit_m1, pars = "eta", ci_level = 0.95, outer_level = 1, show_density = T, point_est = "mean")
+stan_plot(fit_m1, pars = "tau", ci_level = 0.95, outer_level = 1, show_density = T, point_est = "mean")
+
+#################################################################model diagnostics#########################################################################
+#various plotting with bayesplot: see also https://dastatis.github.io/pdf/StanAdvent2018/bayesplot.html
+#see also: "RStan: the R interface to Stan"
+#see also: https://betanalpha.github.io/assets/case_studies/rstan_workflow.html
+###1. Convergence and divergence
+#1.1. overlaps between different chains 
+traceplot(fit_m1, pars = c("mu_eta", "mu_tau",'sigma')) #all are group-level parameters # should be stationary and overylap to each other
+mcmc_rank_hist(fit_m1, pars = paste0(c("mu_eta", "mu_tau",'sigma[1]','sigma[2]')), ref_line = TRUE) # should be uniformly distributed
+
+#1.2. Rhat, must be below 1.01 to make sure that parameter estimates could be trusted (Baribault & Collins, 2022)
+#get the rhat values for all (including both group and individual) parameters
+rhats <- mcmc_rhat_data(rhat(fit_m1)) # a tibble format
+stan_rhat(fit_m1)
+#stan_rhat(fit_m1)$data
+mcmc_rhat(rhat(fit_m1))
+
+#1.3.energy diagnostic plot, E and deltaE should overlap each other.
+mcmc_nuts_energy(nuts_params(fit_m1))
+
+
+
+
+###2. Sampling efficiency
+#2.1. for n_eff ratio, if it is less than 0.1, indicating high auto-correlation, model fitting fails
+#get the n_eff ratio values for all (including both group and individual) parameters
+neff_ratio <- mcmc_neff_data(neff_ratio(fit_m1)) # a tibble format
+stan_ess(fit_m1)
+mcmc_neff(neff_ratio(fit_m1))
+
+#2.2. auto correlations, should decrease with lag (larger correlation with small lag, but smaller correlation with large lag)
+mcmc_acf(as.array(fit_m1), pars = paste0(c("mu_eta", "mu_tau",'sigma[1]','sigma[2]')),inc_warmup = F)
+
+#2.3. for total sample size, should be 4000.
+length(extract(fit_m1, pars = "lp__")[[1]])
+
+
+
+
+#3. for divergent transitions, n_treedepth, accept_stat (i.e., adapt_delta parameter), stepsize, and energy
+summary(do.call(rbind,args = get_sampler_params(fit_m1,inc_warmup = F)),digits=2) # across all chains
+lapply(get_sampler_params(fit_m1,inc_warmup = F),summary,digits=2) # for each chain
+
+check_hmc_diagnostics(fit_m1) # explicit checking of above parameters,including warmup transitions
+
+#4. NUTS diagnose
+stan_diag(fit_m1)
+
+#5. correlations of posterior samples of different parameters
+#color_scheme_set("darkgray")
+mcmc_pairs(
+  as.array(fit_m1),
+  pars = paste0(c("mu_eta","mu_tau","sigma[1]","sigma[2]")), 
+  np = nuts_params(fit_m1))
+
+```
+
+5.2 set up model 2, m2_rp
+```{r set up model 2}
+ncore <- 3
+options(mc.cores = ncore) #adapted from hBayesDM_model.R
+rstan_options(javascript=FALSE) # see also: https://discourse.mc-stan.org/t/error-in-open-connection-con-open-mode-timeout-was-reached-github-com/23162/6
+
+#model 2, the RP model, three parameters: etar,etap and tau
+pars_m2 <- c("mu_etar","mu_etap",'mu_tau','sigma',"etar","etap",'tau','log_lik')
+fit_m2 <- stan(file=paste0(getwd(),'/m2_rp.stan'), data=data_list,
+                             pars    = pars_m2,
+                             chains  = 3,
+                             iter    = 4000,
+                             warmup  = 2000,
+                             thin    = 1,
+                             control = list(adapt_delta   = 0.95,
+                                            stepsize      = 1,
+                                            max_treedepth = 10))
+
+#################################################################model fit & save model & plots#############################################################
+save(fit_m2,file='fit_m2.RData')
+printFit(fit_m2,ic="both")
+print(fit_m2, pars = c("mu_etar","mu_etap", "mu_tau",'sigma')) #all are group-level parameters
+
+#plot group parameters
+stan_dens(fit_m2, pars = paste0(c("mu_etar","mu_etap", "mu_tau",'sigma[1]','sigma[2]','sigma[3]')), separate_chains = T) #should overlap to each other
+#plot individual parameters
+stan_plot(fit_m2, pars = "etar", ci_level = 0.95, outer_level = 1, show_density = T, point_est = "mean")
+stan_plot(fit_m2, pars = "etap", ci_level = 0.95, outer_level = 1, show_density = T, point_est = "mean")
+stan_plot(fit_m2, pars = "tau", ci_level = 0.95, outer_level = 1, show_density = T, point_est = "mean")
+
+#################################################################model diagnostics#########################################################################
+#various plotting with bayesplot: see also https://dastatis.github.io/pdf/StanAdvent2018/bayesplot.html
+#see also: "RStan: the R interface to Stan"
+#see also: https://betanalpha.github.io/assets/case_studies/rstan_workflow.html
+###1. Convergence and divergence
+#1.1. overlaps between different chains 
+traceplot(fit_m2, pars = c("mu_etar","mu_etap","mu_tau",'sigma')) #all are group-level parameters # should be stationary and overylap to each other
+mcmc_rank_hist(fit_m2, pars = paste0(c("mu_etar","mu_etap","mu_tau",'sigma[1]','sigma[2]','sigma[3]')), ref_line = TRUE) # should be uniformly distributed
+
+#1.2. Rhat, must be below 1.01 to make sure that parameter estimates could be trusted (Baribault & Collins, 2022)
+#get the rhat values for all (including both group and individual) parameters
+rhats <- mcmc_rhat_data(rhat(fit_m2)) # a tibble format
+stan_rhat(fit_m2)
+#stan_rhat(fit_m2)$data
+mcmc_rhat(rhat(fit_m2))
+
+#1.3.energy diagnostic plot, E and deltaE should overlap each other.
+mcmc_nuts_energy(nuts_params(fit_m2))
+
+
+
+
+###2. Sampling efficiency
+#2.1. for n_eff ratio, if it is less than 0.1, indicating high auto-correlation, model fitting fails
+#get the n_eff ratio values for all (including both group and individual) parameters
+neff_ratio <- mcmc_neff_data(neff_ratio(fit_m2)) # a tibble format
+stan_ess(fit_m2)
+mcmc_neff(neff_ratio(fit_m2))
+
+#2.2. auto correlations, should decrease with lag (larger correlation with small lag, but smaller correlation with large lag)
+mcmc_acf(as.array(fit_m2), pars = paste0(c("mu_etar","mu_etap","mu_tau",'sigma[1]','sigma[2]','sigma[3]')),inc_warmup = F)
+
+#2.3. for total sample size, should be 4000.
+length(extract(fit_m2, pars = "lp__")[[1]])
+
+
+
+
+#3. for divergent transitions, n_treedepth, accept_stat (i.e., adapt_delta parameter), stepsize, and energy
+summary(do.call(rbind,args = get_sampler_params(fit_m2,inc_warmup = F)),digits=2) # across all chains
+lapply(get_sampler_params(fit_m2,inc_warmup = F),summary,digits=2) # for each chain
+
+check_hmc_diagnostics(fit_m2) # explicit checking of above parameters,including warmup transitions
+
+#4. NUTS diagnose
+stan_diag(fit_m2)
+
+#5. correlations of posterior samples of different parameters
+#color_scheme_set("darkgray")
+mcmc_pairs(
+  as.array(fit_m2),
+  pars = paste0(c("mu_etar","mu_etap","mu_tau",'sigma[1]','sigma[2]','sigma[3]')), 
+  np = nuts_params(fit_m2))
+
+```
+
+
+5.3 set up model 3, m3_forget
+```{r set up model 3}
+ncore <- 3
+options(mc.cores = ncore) #adapted from hBayesDM_model.R
+rstan_options(javascript=FALSE) # see also: https://discourse.mc-stan.org/t/error-in-open-connection-con-open-mode-timeout-was-reached-github-com/23162/6
+
+
+#model 3, the forget model, three parameters: eta,fp and tau
+pars_m3 <- c("mu_eta","mu_fp",'mu_tau','sigma',"eta","fp",'tau','log_lik')
+fit_m3 <- stan(file=paste0(getwd(),'/m3_forget.stan'), data=data_list,
+                             pars    = pars_m3,
+                             chains  = 3,
+                             iter    = 4000,
+                             warmup  = 2000,
+                             thin    = 1,
+                             control = list(adapt_delta   = 0.95,
+                                            stepsize      = 1,
+                                            max_treedepth = 10))
+
+#################################################################model fit & save model & plots#############################################################
+save(fit_m3,file='fit_m3.RData')
+printFit(fit_m3,ic="both")
+print(fit_m3, pars = c("mu_eta","mu_fp", "mu_tau",'sigma')) #all are group-level parameters
+
+#plot group parameters
+stan_dens(fit_m3, pars = paste0(c("mu_eta","mu_fp", "mu_tau",'sigma[1]','sigma[2]','sigma[3]')), separate_chains = T) #should overlap to each other
+#plot individual parameters
+stan_plot(fit_m3, pars = "eta", ci_level = 0.95, outer_level = 1, show_density = T, point_est = "mean")
+stan_plot(fit_m3, pars = "fp", ci_level = 0.95, outer_level = 1, show_density = T, point_est = "mean")
+stan_plot(fit_m3, pars = "tau", ci_level = 0.95, outer_level = 1, show_density = T, point_est = "mean")
+
+#################################################################model diagnostics#########################################################################
+#various plotting with bayesplot: see also https://dastatis.github.io/pdf/StanAdvent2018/bayesplot.html
+#see also: "RStan: the R interface to Stan"
+#see also: https://betanalpha.github.io/assets/case_studies/rstan_workflow.html
+###1. Convergence and divergence
+#1.1. overlaps between different chains 
+traceplot(fit_m3, pars = c("mu_eta","mu_fp","mu_tau",'sigma')) #all are group-level parameters # should be stationary and overylap to each other
+mcmc_rank_hist(fit_m3, pars = paste0(c("mu_eta","mu_fp","mu_tau",'sigma[1]','sigma[2]','sigma[3]')), ref_line = TRUE) # should be uniformly distributed
+
+#1.2. Rhat, must be below 1.01 to make sure that parameter estimates could be trusted (Baribault & Collins, 2022)
+#get the rhat values for all (including both group and individual) parameters
+rhats <- mcmc_rhat_data(rhat(fit_m3)) # a tibble format
+stan_rhat(fit_m3)
+#stan_rhat(fit_m3)$data
+mcmc_rhat(rhat(fit_m3))
+
+#1.3.energy diagnostic plot, E and deltaE should overlap each other.
+mcmc_nuts_energy(nuts_params(fit_m3))
+
+
+
+###2. Sampling efficiency
+#2.1. for n_eff ratio, if it is less than 0.1, indicating high auto-correlation, model fitting fails
+#get the n_eff ratio values for all (including both group and individual) parameters
+neff_ratio <- mcmc_neff_data(neff_ratio(fit_m3)) # a tibble format
+stan_ess(fit_m3)
+mcmc_neff(neff_ratio(fit_m3))
+
+#2.2. auto correlations, should decrease with lag (larger correlation with small lag, but smaller correlation with large lag)
+mcmc_acf(as.array(fit_m3), pars = paste0(c("mu_eta","mu_fp","mu_tau",'sigma[1]','sigma[2]','sigma[3]')),inc_warmup = F)
+
+#2.3. for total sample size, should be 4000.
+length(extract(fit_m3, pars = "lp__")[[1]])
+
+
+
+#3. for divergent transitions, n_treedepth, accept_stat (i.e., adapt_delta parameter), stepsize, and energy
+summary(do.call(rbind,args = get_sampler_params(fit_m3,inc_warmup = F)),digits=2) # across all chains
+lapply(get_sampler_params(fit_m3,inc_warmup = F),summary,digits=2) # for each chain
+
+check_hmc_diagnostics(fit_m3) # explicit checking of above parameters,including warmup transitions
+
+#4. NUTS diagnose
+stan_diag(fit_m3)
+
+#5. correlations of posterior samples of different parameters
+#color_scheme_set("darkgray")
+mcmc_pairs(
+  as.array(fit_m3),
+  pars = paste0(c("mu_eta","mu_fp","mu_tau",'sigma[1]','sigma[2]','sigma[3]')), 
+  np = nuts_params(fit_m3))
+
+```
+
+
+
+5.4 set up model 4, m4_ck
+```{r set up model 4}
+ncore <- 3
+options(mc.cores = ncore) #adapted from hBayesDM_model.R
+rstan_options(javascript=FALSE) # see also: https://discourse.mc-stan.org/t/error-in-open-connection-con-open-mode-timeout-was-reached-github-com/23162/6
+
+#model 4, the ck model, two parameters: eta and tau
+pars_m4 <- c('mu_eta','mu_tau','sigma','eta','tau','log_lik')
+fit_m4 <- stan(file=paste0(getwd(),'/m4_ck.stan'), data=data_list,
+                             pars    = pars_m4,
+                             chains  = 3,
+                             iter    = 4000,
+                             warmup  = 2000,
+                             thin    = 1,
+                             control = list(adapt_delta   = 0.95,
+                                            stepsize      = 1,
+                                            max_treedepth = 10))
+
+#################################################################model fit & save model & plots#############################################################
+save(fit_m4,file='fit_m4.RData')
+printFit(fit_m4,ic="both")
+print(fit_m4, pars = c("mu_eta", "mu_tau",'sigma')) #all are group-level parameters
+
+#plot group parameters
+stan_dens(fit_m4, pars = paste0(c("mu_eta", "mu_tau",'sigma[1]','sigma[2]')), separate_chains = T) #should overlap to each other
+#plot individual parameters
+stan_plot(fit_m4, pars = "eta", ci_level = 0.95, outer_level = 1, show_density = T, point_est = "mean")
+stan_plot(fit_m4, pars = "tau", ci_level = 0.95, outer_level = 1, show_density = T, point_est = "mean")
+
+#################################################################model diagnostics#########################################################################
+#various plotting with bayesplot: see also https://dastatis.github.io/pdf/StanAdvent2018/bayesplot.html
+#see also: "RStan: the R interface to Stan"
+#see also: https://betanalpha.github.io/assets/case_studies/rstan_workflow.html
+###1. Convergence and divergence
+#1.1. overlaps between different chains 
+traceplot(fit_m4, pars = c("mu_eta", "mu_tau",'sigma')) #all are group-level parameters # should be stationary and overylap to each other
+mcmc_rank_hist(fit_m4, pars = paste0(c("mu_eta", "mu_tau",'sigma[1]','sigma[2]')), ref_line = TRUE) # should be uniformly distributed
+
+#1.2. Rhat, must be below 1.01 to make sure that parameter estimates could be trusted (Baribault & Collins, 2022)
+#get the rhat values for all (including both group and individual) parameters
+rhats <- mcmc_rhat_data(rhat(fit_m4)) # a tibble format
+stan_rhat(fit_m4)
+#stan_rhat(fit_m4)$data
+mcmc_rhat(rhat(fit_m4))
+
+#1.3.energy diagnostic plot, E and deltaE should overlap each other.
+mcmc_nuts_energy(nuts_params(fit_m4))
+
+
+
+###2. Sampling efficiency
+#2.1. for n_eff ratio, if it is less than 0.1, indicating high auto-correlation, model fitting fails
+#get the n_eff ratio values for all (including both group and individual) parameters
+neff_ratio <- mcmc_neff_data(neff_ratio(fit_m4)) # a tibble format
+stan_ess(fit_m4)
+mcmc_neff(neff_ratio(fit_m4))
+
+#2.2. auto correlations, should decrease with lag (larger correlation with small lag, but smaller correlation with large lag)
+mcmc_acf(as.array(fit_m4), pars = paste0(c("mu_eta", "mu_tau",'sigma[1]','sigma[2]')),inc_warmup = F)
+
+#2.3. for total sample size, should be 4000.
+length(extract(fit_m4, pars = "lp__")[[1]])
+
+
+
+#3. for divergent transitions, n_treedepth, accept_stat (i.e., adapt_delta parameter), stepsize, and energy
+summary(do.call(rbind,args = get_sampler_params(fit_m4,inc_warmup = F)),digits=2) # across all chains
+lapply(get_sampler_params(fit_m4,inc_warmup = F),summary,digits=2) # for each chain
+
+check_hmc_diagnostics(fit_m4) # explicit checking of above parameters,including warmup transitions
+
+#4. NUTS diagnose
+stan_diag(fit_m4)
+
+#5. correlations of posterior samples of different parameters
+#color_scheme_set("darkgray")
+mcmc_pairs(
+  as.array(fit_m4),
+  pars = paste0(c("mu_eta","mu_tau","sigma[1]","sigma[2]")), 
+  np = nuts_params(fit_m4))
+```
+
+5.5 set up model 5, m5_rp_forget
+```{r set up model 5}
+ncore <- 3
+options(mc.cores = ncore) #adapted from hBayesDM_model.R
+rstan_options(javascript=FALSE) # see also: https://discourse.mc-stan.org/t/error-in-open-connection-con-open-mode-timeout-was-reached-github-com/23162/6
+
+
+#model 5, the rp_forget model, four parameters: etar,etap,fp and tau
+pars_m5 <- c("mu_etar","mu_etap",'mu_fp','mu_tau','sigma',"etar","etap",'fp','tau','log_lik')
+fit_m5 <- stan(file=paste0(getwd(),'/m5_rp_forget.stan'), data=data_list,
+                             pars    = pars_m5,
+                             chains  = 3,
+                             iter    = 4000,
+                             warmup  = 2000,
+                             thin    = 1,
+                             control = list(adapt_delta   = 0.95,
+                                            stepsize      = 1,
+                                            max_treedepth = 10))
+
+#################################################################model fit & save model & plots#############################################################
+save(fit_m5,file='fit_m5.RData')
+printFit(fit_m5,ic="both")
+print(fit_m5, pars = c("mu_etar","mu_etap","mu_fp", "mu_tau",'sigma')) #all are group-level parameters
+
+#plot group parameters
+stan_dens(fit_m5, pars = paste0(c("mu_etar","mu_etap","mu_fp","mu_tau","sigma[1]","sigma[2]","sigma[3]","sigma[4]")), separate_chains = T) #should overlap to each other
+#plot individual parameters
+stan_plot(fit_m5, pars = "etar", ci_level = 0.95, outer_level = 1, show_density = T, point_est = "mean")
+stan_plot(fit_m5, pars = "etap", ci_level = 0.95, outer_level = 1, show_density = T, point_est = "mean")
+stan_plot(fit_m5, pars = "fp", ci_level = 0.95, outer_level = 1, show_density = T, point_est = "mean")
+stan_plot(fit_m5, pars = "tau", ci_level = 0.95, outer_level = 1, show_density = T, point_est = "mean")
+
+#################################################################model diagnostics#########################################################################
+#various plotting with bayesplot: see also https://dastatis.github.io/pdf/StanAdvent2018/bayesplot.html
+#see also: "RStan: the R interface to Stan"
+#see also: https://betanalpha.github.io/assets/case_studies/rstan_workflow.html
+###1. Convergence and divergence
+#1.1. overlaps between different chains 
+traceplot(fit_m5, pars = c("mu_etar","mu_etap","mu_fp","mu_tau",'sigma')) #all are group-level parameters # should be stationary and overylap to each other
+mcmc_rank_hist(fit_m5, pars = paste0(c("mu_etar","mu_etap","mu_fp","mu_tau","sigma[1]","sigma[2]","sigma[3]","sigma[4]")), ref_line = TRUE) # should be uniformly distributed
+
+#1.2. Rhat, must be below 1.01 to make sure that parameter estimates could be trusted (Baribault & Collins, 2022)
+#get the rhat values for all (including both group and individual) parameters
+rhats <- mcmc_rhat_data(rhat(fit_m5)) # a tibble format
+stan_rhat(fit_m5)
+#stan_rhat(fit_m5)$data
+mcmc_rhat(rhat(fit_m5))
+
+#1.3.energy diagnostic plot, E and deltaE should overlap each other.
+mcmc_nuts_energy(nuts_params(fit_m5))
+
+
+
+###2. Sampling efficiency
+#2.1. for n_eff ratio, if it is less than 0.1, indicating high auto-correlation, model fitting fails
+#get the n_eff ratio values for all (including both group and individual) parameters
+neff_ratio <- mcmc_neff_data(neff_ratio(fit_m5)) # a tibble format
+stan_ess(fit_m5)
+mcmc_neff(neff_ratio(fit_m5))
+
+#2.2. auto correlations, should decrease with lag (larger correlation with small lag, but smaller correlation with large lag)
+mcmc_acf(as.array(fit_m5), pars = paste0(c("mu_etar","mu_etap","mu_fp","mu_tau","sigma[1]","sigma[2]","sigma[3]","sigma[4]")),inc_warmup = F)
+
+#2.3. for total sample size, should be 4000.
+length(extract(fit_m5, pars = "lp__")[[1]])
+
+
+
+#3. for divergent transitions, n_treedepth, accept_stat (i.e., adapt_delta parameter), stepsize, and energy
+summary(do.call(rbind,args = get_sampler_params(fit_m5,inc_warmup = F)),digits=2) # across all chains
+lapply(get_sampler_params(fit_m5,inc_warmup = F),summary,digits=2) # for each chain
+
+check_hmc_diagnostics(fit_m5) # explicit checking of above parameters,including warmup transitions
+
+#4. NUTS diagnose
+stan_diag(fit_m5)
+
+#5. correlations of posterior samples of different parameters
+#color_scheme_set("darkgray")
+mcmc_pairs(
+  as.array(fit_m5),
+  pars = paste0(c("mu_etar","mu_etap","mu_fp","mu_tau")), 
+  np = nuts_params(fit_m5))
+
+```
+
+
+5.6 set up model 6, m6_rp_ck
+```{r set up model 6}
+ncore <- 3
+options(mc.cores = ncore) #adapted from hBayesDM_model.R
+rstan_options(javascript=FALSE) # see also: https://discourse.mc-stan.org/t/error-in-open-connection-con-open-mode-timeout-was-reached-github-com/23162/6
+
+
+#model 6, the rp_ck model, five parameters: etar,etap,tau,etack,tauck
+pars_m6 <- c("mu_etar","mu_etap","mu_tau","mu_etack","mu_tauck",'sigma',"etar","etap","tau","etack","tauck",'log_lik')
+fit_m6 <- stan(file=paste0(getwd(),'/m6_rp_ck.stan'), data=data_list,
+                             pars    = pars_m6,
+                             chains  = 3,
+                             iter    = 4000,
+                             warmup  = 2000,
+                             thin    = 1,
+                             control = list(adapt_delta   = 0.95,
+                                            stepsize      = 1,
+                                            max_treedepth = 10))
+
+#################################################################model fit & save model & plots#############################################################
+save(fit_m6,file='fit_m6.RData')
+printFit(fit_m6,ic="both")
+print(fit_m6, pars = c("mu_etar","mu_etap","mu_tau","mu_etack","mu_tauck",'sigma')) #all are group-level parameters
+
+#plot group parameters
+stan_dens(fit_m6, pars = paste0(c("mu_etar","mu_etap","mu_tau","mu_etack","mu_tauck",'sigma[1]','sigma[2]','sigma[3]',"sigma[4]","sigma[5]")), separate_chains = T) #should overlap to each other
+#plot individual parameters
+stan_plot(fit_m6, pars = "etar", ci_level = 0.95, outer_level = 1, show_density = T, point_est = "mean")
+stan_plot(fit_m6, pars = "etap", ci_level = 0.95, outer_level = 1, show_density = T, point_est = "mean")
+stan_plot(fit_m6, pars = "tau", ci_level = 0.95, outer_level = 1, show_density = T, point_est = "mean")
+stan_plot(fit_m6, pars = "etack", ci_level = 0.95, outer_level = 1, show_density = T, point_est = "mean")
+stan_plot(fit_m6, pars = "tauck", ci_level = 0.95, outer_level = 1, show_density = T, point_est = "mean")
+
+#################################################################model diagnostics#########################################################################
+#various plotting with bayesplot: see also https://dastatis.github.io/pdf/StanAdvent2018/bayesplot.html
+#see also: "RStan: the R interface to Stan"
+#see also: https://betanalpha.github.io/assets/case_studies/rstan_workflow.html
+###1. Convergence and divergence
+#1.1. overlaps between different chains 
+traceplot(fit_m6, pars = c("mu_etar","mu_etap","mu_tau","mu_etack","mu_tauck",'sigma')) #all are group-level parameters # should be stationary and overylap to each other
+mcmc_rank_hist(fit_m6, pars = paste0(c("mu_etar","mu_etap","mu_tau","mu_etack","mu_tauck",'sigma[1]','sigma[2]','sigma[3]',"sigma[4]","sigma[5]")), ref_line = TRUE) # should be uniformly distributed
+
+#1.2. Rhat, must be below 1.01 to make sure that parameter estimates could be trusted (Baribault & Collins, 2022)
+#get the rhat values for all (including both group and individual) parameters
+rhats <- mcmc_rhat_data(rhat(fit_m6)) # a tibble format
+stan_rhat(fit_m6)
+#stan_rhat(fit_m6)$data
+mcmc_rhat(rhat(fit_m6))
+
+#1.3.energy diagnostic plot, E and deltaE should overlap each other.
+mcmc_nuts_energy(nuts_params(fit_m6))
+
+
+
+###2. Sampling efficiency
+#2.1. for n_eff ratio, if it is less than 0.1, indicating high auto-correlation, model fitting fails
+#get the n_eff ratio values for all (including both group and individual) parameters
+neff_ratio <- mcmc_neff_data(neff_ratio(fit_m6)) # a tibble format
+stan_ess(fit_m6)
+mcmc_neff(neff_ratio(fit_m6))
+
+#2.2. auto correlations, should decrease with lag (larger correlation with small lag, but smaller correlation with large lag)
+mcmc_acf(as.array(fit_m6), pars = paste0(c("mu_etar","mu_etap","mu_tau","mu_etack","mu_tauck",'sigma[1]','sigma[2]','sigma[3]',"sigma[4]","sigma[5]")),inc_warmup = F)
+
+#2.3. for total sample size, should be 4000.
+length(extract(fit_m6, pars = "lp__")[[1]])
+
+
+
+#3. for divergent transitions, n_treedepth, accept_stat (i.e., adapt_delta parameter), stepsize, and energy
+summary(do.call(rbind,args = get_sampler_params(fit_m6,inc_warmup = F)),digits=2) # across all chains
+lapply(get_sampler_params(fit_m6,inc_warmup = F),summary,digits=2) # for each chain
+
+check_hmc_diagnostics(fit_m6) # explicit checking of above parameters,including warmup transitions
+
+#4. NUTS diagnose
+stan_diag(fit_m6)
+
+#5. correlations of posterior samples of different parameters
+#color_scheme_set("darkgray")
+mcmc_pairs(
+  as.array(fit_m6),
+  pars = paste0(c("mu_etar","mu_etap","mu_tau","mu_etack","mu_tauck")), 
+  np = nuts_params(fit_m6))
+
+```
+
+
+
+5.7 set up model 7, m7_rp_fg_ck
+```{r set up model 7}
+ncore <- 3
+options(mc.cores = ncore) #adapted from hBayesDM_model.R
+rstan_options(javascript=FALSE) # see also: https://discourse.mc-stan.org/t/error-in-open-connection-con-open-mode-timeout-was-reached-github-com/23162/6
+
+
+#model 7, the rp_fg_ck model, six parameters: etar,etap,tau,etack,tauck,fp
+pars_m7 <- c("mu_etar","mu_etap","mu_tau","mu_etack","mu_tauck","mu_fp",'sigma',"etar","etap","tau","etack","tauck","fp",'log_lik')
+fit_m7 <- stan(file=paste0(getwd(),'/m7_rp_fg_ck.stan'), data=data_list,
+                             pars    = pars_m7,
+                             chains  = 3,
+                             iter    = 4000,
+                             warmup  = 2000,
+                             thin    = 1,
+                             control = list(adapt_delta   = 0.95,
+                                            stepsize      = 1,
+                                            max_treedepth = 10))
+
+#################################################################model fit & save model & plots#############################################################
+save(fit_m7,file='fit_m7.RData')
+printFit(fit_m7,ic="both")
+print(fit_m7, pars = c("mu_etar","mu_etap","mu_tau","mu_etack","mu_tauck","mu_fp",'sigma')) #all are group-level parameters
+
+#plot group parameters
+stan_dens(fit_m7, pars = paste0(c("mu_etar","mu_etap","mu_tau","mu_etack","mu_tauck","mu_fp",'sigma[1]','sigma[2]','sigma[3]',"sigma[4]","sigma[5]","sigma[6]")), separate_chains = T) #should overlap to each other
+#plot individual parameters
+stan_plot(fit_m7, pars = "etar", ci_level = 0.95, outer_level = 1, show_density = T, point_est = "mean")
+stan_plot(fit_m7, pars = "etap", ci_level = 0.95, outer_level = 1, show_density = T, point_est = "mean")
+stan_plot(fit_m7, pars = "tau", ci_level = 0.95, outer_level = 1, show_density = T, point_est = "mean")
+stan_plot(fit_m7, pars = "etack", ci_level = 0.95, outer_level = 1, show_density = T, point_est = "mean")
+stan_plot(fit_m7, pars = "tauck", ci_level = 0.95, outer_level = 1, show_density = T, point_est = "mean")
+stan_plot(fit_m7, pars = "fp", ci_level = 0.95, outer_level = 1, show_density = T, point_est = "mean")
+
+#################################################################model diagnostics#########################################################################
+#various plotting with bayesplot: see also https://dastatis.github.io/pdf/StanAdvent2018/bayesplot.html
+#see also: "RStan: the R interface to Stan"
+#see also: https://betanalpha.github.io/assets/case_studies/rstan_workflow.html
+###1. Convergence and divergence
+#1.1. overlaps between different chains 
+traceplot(fit_m7, pars = c("mu_etar","mu_etap","mu_tau","mu_etack","mu_tauck","mu_fp",'sigma')) #all are group-level parameters # should be stationary and overylap to each other
+mcmc_rank_hist(fit_m7, pars = paste0(c("mu_etar","mu_etap","mu_tau","mu_etack","mu_tauck","mu_fp",'sigma[1]','sigma[2]','sigma[3]',"sigma[4]","sigma[5]","sigma[6]")), ref_line = TRUE) # should be uniformly distributed
+
+#1.2. Rhat, must be below 1.01 to make sure that parameter estimates could be trusted (Baribault & Collins, 2022)
+#get the rhat values for all (including both group and individual) parameters
+rhats <- mcmc_rhat_data(rhat(fit_m7)) # a tibble format
+stan_rhat(fit_m7)
+#stan_rhat(fit_m7)$data
+mcmc_rhat(rhat(fit_m7))
+
+#1.3.energy diagnostic plot, E and deltaE should overlap each other.
+mcmc_nuts_energy(nuts_params(fit_m7))
+
+
+
+###2. Sampling efficiency
+#2.1. for n_eff ratio, if it is less than 0.1, indicating high auto-correlation, model fitting fails
+#get the n_eff ratio values for all (including both group and individual) parameters
+neff_ratio <- mcmc_neff_data(neff_ratio(fit_m7)) # a tibble format
+stan_ess(fit_m7)
+mcmc_neff(neff_ratio(fit_m7))
+
+#2.2. auto correlations, should decrease with lag (larger correlation with small lag, but smaller correlation with large lag)
+mcmc_acf(as.array(fit_m7), pars = paste0(c("mu_etar","mu_etap","mu_tau","mu_etack","mu_tauck","mu_fp",'sigma[1]','sigma[2]','sigma[3]',"sigma[4]","sigma[5]","sigma[6]")),inc_warmup = F)
+
+#2.3. for total sample size, should be 4000.
+length(extract(fit_m7, pars = "lp__")[[1]])
+
+
+
+#3. for divergent transitions, n_treedepth, accept_stat (i.e., adapt_delta parameter), stepsize, and energy
+summary(do.call(rbind,args = get_sampler_params(fit_m7,inc_warmup = F)),digits=2) # across all chains
+lapply(get_sampler_params(fit_m7,inc_warmup = F),summary,digits=2) # for each chain
+
+check_hmc_diagnostics(fit_m7) # explicit checking of above parameters,including warmup transitions
+
+#4. NUTS diagnose
+stan_diag(fit_m7)
+
+#5. correlations of posterior samples of different parameters
+#color_scheme_set("darkgray")
+mcmc_pairs(
+  as.array(fit_m7),
+  pars = paste0(c("mu_etar","mu_etap","mu_tau","mu_etack","mu_tauck","mu_fp")), 
+  np = nuts_params(fit_m7))
+
+
+```
+
+5.7b set up model 7b, m7b_vLR
+```{r set up model 7b}
+ncore <- 3
+options(mc.cores = ncore) #adapted from hBayesDM_model.R
+rstan_options(javascript=FALSE) # see also: https://discourse.mc-stan.org/t/error-in-open-connection-con-open-mode-timeout-was-reached-github-com/23162/6
+
+
+#model 7, the rp_fg_ck model, six parameters: etar,etap,tau,etack,tauck,fp
+pars_m7b <- c("mu_etar","mu_etap","mu_tau","mu_etack","mu_tauck","mu_fp",'sigma',"etar","etap","tau","etack","tauck","fp",'log_lik')
+fit_m7b <- stan(file=paste0(getwd(),'/m7b_vLR.stan'), data=data_list,
+                             pars    = pars_m7b,
+                             chains  = 3,
+                             iter    = 4000,
+                             warmup  = 2000,
+                             thin    = 1,
+                             control = list(adapt_delta   = 0.95,
+                                            stepsize      = 1,
+                                            max_treedepth = 10))
+
+#################################################################model fit & save model & plots#############################################################
+save(fit_m7b,file='fit_m7b.RData')
+printFit(fit_m7b,ic="both")
+print(fit_m7b, pars = c("mu_etar","mu_etap","mu_tau","mu_etack","mu_tauck","mu_fp",'sigma')) #all are group-level parameters
+
+#plot group parameters
+stan_dens(fit_m7b, pars = paste0(c("mu_etar[1]","mu_etar[2]","mu_etar[3]","mu_etap[1]","mu_etap[2]","mu_etap[3]","mu_tau","mu_etack","mu_tauck","mu_fp")), separate_chains = T) #should overlap to each other
+#plot individual parameters
+stan_plot(fit_m7b, pars = "etar", ci_level = 0.95, outer_level = 1, show_density = T, point_est = "mean")
+stan_plot(fit_m7b, pars = "etap", ci_level = 0.95, outer_level = 1, show_density = T, point_est = "mean")
+stan_plot(fit_m7b, pars = "tau", ci_level = 0.95, outer_level = 1, show_density = T, point_est = "mean")
+stan_plot(fit_m7b, pars = "etack", ci_level = 0.95, outer_level = 1, show_density = T, point_est = "mean")
+stan_plot(fit_m7b, pars = "tauck", ci_level = 0.95, outer_level = 1, show_density = T, point_est = "mean")
+stan_plot(fit_m7b, pars = "fp", ci_level = 0.95, outer_level = 1, show_density = T, point_est = "mean")
+
+#################################################################model diagnostics#########################################################################
+#various plotting with bayesplot: see also https://dastatis.github.io/pdf/StanAdvent2018/bayesplot.html
+#see also: "RStan: the R interface to Stan"
+#see also: https://betanalpha.github.io/assets/case_studies/rstan_workflow.html
+###1. Convergence and divergence
+#1.1. overlaps between different chains 
+traceplot(fit_m7b, pars = c("mu_etar","mu_etap","mu_tau","mu_etack","mu_tauck","mu_fp",'sigma')) #all are group-level parameters # should be stationary and overylap to each other
+mcmc_rank_hist(fit_m7b, pars = paste0(c("mu_etar[1]","mu_etar[2]","mu_etar[3]","mu_etap[1]","mu_etap[2]","mu_etap[3]","mu_tau","mu_etack","mu_tauck","mu_fp")), ref_line = TRUE) # should be uniformly distributed
+
+#1.2. Rhat, must be below 1.01 to make sure that parameter estimates could be trusted (Baribault & Collins, 2022)
+#get the rhat values for all (including both group and individual) parameters
+rhats <- mcmc_rhat_data(rhat(fit_m7b)) # a tibble format
+stan_rhat(fit_m7b)
+#stan_rhat(fit_m7b)$data
+mcmc_rhat(rhat(fit_m7b))
+
+#1.3.energy diagnostic plot, E and deltaE should overlap each other.
+mcmc_nuts_energy(nuts_params(fit_m7b))
+
+
+
+###2. Sampling efficiency
+#2.1. for n_eff ratio, if it is less than 0.1, indicating high auto-correlation, model fitting fails
+#get the n_eff ratio values for all (including both group and individual) parameters
+neff_ratio <- mcmc_neff_data(neff_ratio(fit_m7b)) # a tibble format
+stan_ess(fit_m7b)
+mcmc_neff(neff_ratio(fit_m7b))
+
+#2.2. auto correlations, should decrease with lag (larger correlation with small lag, but smaller correlation with large lag)
+mcmc_acf(as.array(fit_m7b), pars = paste0(c("mu_etar[1]","mu_etar[2]","mu_etar[3]","mu_etap[1]","mu_etap[2]","mu_etap[3]","mu_tau","mu_etack","mu_tauck","mu_fp")),inc_warmup = F)
+
+#2.3. for total sample size, should be 4000.
+length(extract(fit_m7b, pars = "lp__")[[1]])
+
+
+
+#3. for divergent transitions, n_treedepth, accept_stat (i.e., adapt_delta parameter), stepsize, and energy
+summary(do.call(rbind,args = get_sampler_params(fit_m7b,inc_warmup = F)),digits=2) # across all chains
+lapply(get_sampler_params(fit_m7b,inc_warmup = F),summary,digits=2) # for each chain
+
+check_hmc_diagnostics(fit_m7b) # explicit checking of above parameters,including warmup transitions
+
+#4. NUTS diagnose
+stan_diag(fit_m7b)
+
+# #5. correlations of posterior samples of different parameters
+# #color_scheme_set("darkgray")
+# mcmc_pairs(
+#   as.array(fit_m7b),
+#   pars = paste0(c("mu_etar","mu_etap","mu_tau","mu_etack","mu_tauck","mu_fp")), 
+#   np = nuts_params(fit_m7b))
+# 
+
+```
+
+5.7c set up model 7c, m7c_vdecay
+```{r set up model 7c}
+ncore <- 3
+options(mc.cores = ncore) #adapted from hBayesDM_model.R
+rstan_options(javascript=FALSE) # see also: https://discourse.mc-stan.org/t/error-in-open-connection-con-open-mode-timeout-was-reached-github-com/23162/6
+
+
+#model 7, the rp_fg_ck model, six parameters: etar,etap,tau,etack,tauck,fp
+pars_m7c <- c("mu_etar","mu_etap","mu_kapar","mu_kapap","mu_tau","mu_etack","mu_tauck","mu_fp",'sigma',"etar","etap","kapar","kapap","tau","etack","tauck","fp",'log_lik','y_pred')
+fit_m7c <- stan(file=paste0(getwd(),'/m7c_vdecay.stan'), data=data_list,
+                             pars    = pars_m7c,
+                             chains  = 3,
+                             iter    = 4000,
+                             warmup  = 2000,
+                             thin    = 1,
+                             control = list(adapt_delta   = 0.95,
+                                            stepsize      = 1,
+                                            max_treedepth = 10))
+
+#################################################################model fit & save model & plots#############################################################
+save(fit_m7c,file='fit_m7c.RData')
+printFit(fit_m7c,ic="both")
+print(fit_m7c, pars = c("mu_etar","mu_etap","mu_kapar","mu_kapap","mu_tau","mu_etack","mu_tauck","mu_fp",'sigma')) #all are group-level parameters
+
+#plot group parameters
+stan_dens(fit_m7c, pars = paste0(c("mu_etar","mu_etap","mu_kapar[1]","mu_kapar[2]","mu_kapar[3]","mu_kapap[1]","mu_kapap[2]","mu_kapap[3]","mu_tau","mu_etack","mu_tauck","mu_fp")), separate_chains = T) #should overlap to each other
+#plot individual parameters
+stan_plot(fit_m7c, pars = "etar", ci_level = 0.95, outer_level = 1, show_density = T, point_est = "mean")
+stan_plot(fit_m7c, pars = "etap", ci_level = 0.95, outer_level = 1, show_density = T, point_est = "mean")
+stan_plot(fit_m7c, pars = "kapar", ci_level = 0.95, outer_level = 1, show_density = T, point_est = "mean")
+stan_plot(fit_m7c, pars = "kapap", ci_level = 0.95, outer_level = 1, show_density = T, point_est = "mean")
+stan_plot(fit_m7c, pars = "tau", ci_level = 0.95, outer_level = 1, show_density = T, point_est = "mean")
+stan_plot(fit_m7c, pars = "etack", ci_level = 0.95, outer_level = 1, show_density = T, point_est = "mean")
+stan_plot(fit_m7c, pars = "tauck", ci_level = 0.95, outer_level = 1, show_density = T, point_est = "mean")
+stan_plot(fit_m7c, pars = "fp", ci_level = 0.95, outer_level = 1, show_density = T, point_est = "mean")
+
+#################################################################model diagnostics#########################################################################
+#various plotting with bayesplot: see also https://dastatis.github.io/pdf/StanAdvent2018/bayesplot.html
+#see also: "RStan: the R interface to Stan"
+#see also: https://betanalpha.github.io/assets/case_studies/rstan_workflow.html
+###1. Convergence and divergence
+#1.1. overlaps between different chains 
+traceplot(fit_m7c, pars = c("mu_etar","mu_etap","mu_kapar","mu_kapap","mu_tau","mu_etack","mu_tauck","mu_fp",'sigma')) #all are group-level parameters # should be stationary and overylap to each other
+mcmc_rank_hist(fit_m7c, pars = paste0(c("mu_etar","mu_etap","mu_kapar[1]","mu_kapar[2]","mu_kapar[3]","mu_kapap[1]","mu_kapap[2]","mu_kapap[3]","mu_tau","mu_etack","mu_tauck","mu_fp")), ref_line = TRUE) # should be uniformly distributed
+
+#1.2. Rhat, must be below 1.01 to make sure that parameter estimates could be trusted (Baribault & Collins, 2022)
+#get the rhat values for all (including both group and individual) parameters
+rhats <- mcmc_rhat_data(rhat(fit_m7c)) # a tibble format
+stan_rhat(fit_m7c)
+#stan_rhat(fit_m7c)$data
+mcmc_rhat(rhat(fit_m7c))
+
+#1.3.energy diagnostic plot, E and deltaE should overlap each other.
+mcmc_nuts_energy(nuts_params(fit_m7c))
+
+
+
+###2. Sampling efficiency
+#2.1. for n_eff ratio, if it is less than 0.1, indicating high auto-correlation, model fitting fails
+#get the n_eff ratio values for all (including both group and individual) parameters
+neff_ratio <- mcmc_neff_data(neff_ratio(fit_m7c)) # a tibble format
+stan_ess(fit_m7c)
+mcmc_neff(neff_ratio(fit_m7c))
+
+#2.2. auto correlations, should decrease with lag (larger correlation with small lag, but smaller correlation with large lag)
+mcmc_acf(as.array(fit_m7c), pars = paste0(c("mu_etar","mu_etap","mu_kapar[1]","mu_kapar[2]","mu_kapar[3]","mu_kapap[1]","mu_kapap[2]","mu_kapap[3]",'mu_tau',"mu_etack","mu_tauck","mu_fp")),inc_warmup = F)
+
+#2.3. for total sample size, should be 4000.
+length(extract(fit_m7c, pars = "lp__")[[1]])
+
+
+
+#3. for divergent transitions, n_treedepth, accept_stat (i.e., adapt_delta parameter), stepsize, and energy
+summary(do.call(rbind,args = get_sampler_params(fit_m7c,inc_warmup = F)),digits=2) # across all chains
+lapply(get_sampler_params(fit_m7c,inc_warmup = F),summary,digits=2) # for each chain
+
+check_hmc_diagnostics(fit_m7c) # explicit checking of above parameters,including warmup transitions
+
+#4. NUTS diagnose
+stan_diag(fit_m7c)
+
+# #5. correlations of posterior samples of different parameters
+# #color_scheme_set("darkgray")
+# mcmc_pairs(
+#   as.array(fit_m7c),
+#   pars = paste0(c("mu_etar","mu_etap","mu_kapar","mu_kapap","mu_tau","mu_etack","mu_tauck","mu_fp")), 
+#   np = nuts_params(fit_m7c))
+
+
+```
+
+5.7c2 set up model 7c2, m7c2_vdecay_1kapa
+```{r set up model 7c2}
+ncore <- 3
+options(mc.cores = ncore) #adapted from hBayesDM_model.R
+rstan_options(javascript=FALSE) # see also: https://discourse.mc-stan.org/t/error-in-open-connection-con-open-mode-timeout-was-reached-github-com/23162/6
+
+
+#model 7c2, the m7c2_vdecay_1kapa
+pars_m7c2 <- c("mu_etar","mu_etap","mu_kapa","mu_tau","mu_etack","mu_tauck","mu_fp",'sigma',"etar","etap","kapa","tau","etack","tauck","fp",'log_lik')
+fit_m7c2 <- stan(file=paste0(getwd(),'/m7c2_vdecay_1kapa.stan'), data=data_list,
+                             pars    = pars_m7c2,
+                             chains  = 3,
+                             iter    = 4000,
+                             warmup  = 2000,
+                             thin    = 1,
+                             control = list(adapt_delta   = 0.95,
+                                            stepsize      = 1,
+                                            max_treedepth = 10))
+
+#################################################################model fit & save model & plots#############################################################
+save(fit_m7c2,file='fit_m7c2.RData')
+printFit(fit_m7c2,ic="both")
+print(fit_m7c2, pars = c("mu_etar","mu_etap","mu_kapa","mu_tau","mu_etack","mu_tauck","mu_fp",'sigma')) #all are group-level parameters
+
+#plot group parameters
+stan_dens(fit_m7c2, pars = paste0(c("mu_etar","mu_etap","mu_kapa[1]","mu_kapa[2]","mu_kapa[3]","mu_tau","mu_etack","mu_tauck","mu_fp")), separate_chains = T) #should overlap to each other
+#plot individual parameters
+stan_plot(fit_m7c2, pars = "etar", ci_level = 0.95, outer_level = 1, show_density = T, point_est = "mean")
+stan_plot(fit_m7c2, pars = "etap", ci_level = 0.95, outer_level = 1, show_density = T, point_est = "mean")
+stan_plot(fit_m7c2, pars = "kapa", ci_level = 0.95, outer_level = 1, show_density = T, point_est = "mean")
+stan_plot(fit_m7c2, pars = "tau", ci_level = 0.95, outer_level = 1, show_density = T, point_est = "mean")
+stan_plot(fit_m7c2, pars = "etack", ci_level = 0.95, outer_level = 1, show_density = T, point_est = "mean")
+stan_plot(fit_m7c2, pars = "tauck", ci_level = 0.95, outer_level = 1, show_density = T, point_est = "mean")
+stan_plot(fit_m7c2, pars = "fp", ci_level = 0.95, outer_level = 1, show_density = T, point_est = "mean")
+
+#################################################################model diagnostics#########################################################################
+#various plotting with bayesplot: see also https://dastatis.github.io/pdf/StanAdvent2018/bayesplot.html
+#see also: "RStan: the R interface to Stan"
+#see also: https://betanalpha.github.io/assets/case_studies/rstan_workflow.html
+###1. Convergence and divergence
+#1.1. overlaps between different chains 
+traceplot(fit_m7c2, pars = c("mu_etar","mu_etap","mu_kapa","mu_tau","mu_etack","mu_tauck","mu_fp",'sigma')) #all are group-level parameters # should be stationary and overylap to each other
+mcmc_rank_hist(fit_m7c2, pars = paste0(c("mu_etar","mu_etap","mu_kapa[1]","mu_kapa[2]","mu_kapa[3]","mu_tau","mu_etack","mu_tauck","mu_fp")), ref_line = TRUE) # should be uniformly distributed
+
+#1.2. Rhat, must be below 1.01 to make sure that parameter estimates could be trusted (Baribault & Collins, 2022)
+#get the rhat values for all (including both group and individual) parameters
+rhats <- mcmc_rhat_data(rhat(fit_m7c2)) # a tibble format
+stan_rhat(fit_m7c2)
+#stan_rhat(fit_m7c2)$data
+mcmc_rhat(rhat(fit_m7c2))
+
+#1.3.energy diagnostic plot, E and deltaE should overlap each other.
+mcmc_nuts_energy(nuts_params(fit_m7c2))
+
+
+
+###2. Sampling efficiency
+#2.1. for n_eff ratio, if it is less than 0.1, indicating high auto-correlation, model fitting fails
+#get the n_eff ratio values for all (including both group and individual) parameters
+neff_ratio <- mcmc_neff_data(neff_ratio(fit_m7c2)) # a tibble format
+stan_ess(fit_m7c2)
+mcmc_neff(neff_ratio(fit_m7c2))
+
+#2.2. auto correlations, should decrease with lag (larger correlation with small lag, but smaller correlation with large lag)
+mcmc_acf(as.array(fit_m7c2), pars = paste0(c("mu_etar","mu_etap","mu_kapa[1]","mu_kapa[2]","mu_kapa[3]","mu_tau","mu_etack","mu_tauck","mu_fp")),inc_warmup = F)
+
+#2.3. for total sample size, should be 4000.
+length(extract(fit_m7c2, pars = "lp__")[[1]])
+
+
+
+#3. for divergent transitions, n_treedepth, accept_stat (i.e., adapt_delta parameter), stepsize, and energy
+summary(do.call(rbind,args = get_sampler_params(fit_m7c2,inc_warmup = F)),digits=2) # across all chains
+lapply(get_sampler_params(fit_m7c2,inc_warmup = F),summary,digits=2) # for each chain
+
+check_hmc_diagnostics(fit_m7c2) # explicit checking of above parameters,including warmup transitions
+
+#4. NUTS diagnose
+stan_diag(fit_m7c2)
+
+# #5. correlations of posterior samples of different parameters
+# #color_scheme_set("darkgray")
+# mcmc_pairs(
+#   as.array(fit_m7c2),
+#   pars = paste0(c("mu_etar","mu_etap","mu_kapa","mu_tau","mu_etack","mu_tauck","mu_fp")), 
+#   np = nuts_params(fit_m7c2))
+
+
+###########################################################################individual paramters#######################################################################
+# Extract from the Stan fit object
+parVals <- rstan::extract(fit_m7c2, permuted = TRUE)
+
+# Define measurement of individual parameters
+indPars <- "mean" #extracting mean of parameters
+measure_indPars <- switch(indPars, mean = mean, median = median, mode = estimate_mode)
+which_indPars <- c("etar","etap","tau","etack","tauck","fp")
+
+multp_which_indPars <- 'kapa'
+
+# Measure all individual parameters (per subject)
+allIndPars <- as.data.frame(array(NA, c(n_subj, length(which_indPars))))
+m_allIndPars <- as.data.frame(array(NA, c(n_subj, 50)))
+m_names  <- rep(NULL,50)
+for (i in 1:n_subj) {
+  
+  allIndPars[i, ] <- mapply(function(x) measure_indPars(parVals[[x]][, i]), which_indPars)
+  
+  if (length(multp_which_indPars)>0){  # for parameters in the matrix form
+    count <-0
+    for (nm in 1: length(multp_which_indPars)){
+      for (ds in 1:dim(parVals[[multp_which_indPars[nm]]])[3]){
+        count <- count + 1
+        m_allIndPars[i, count] <- sapply(list(parVals[[multp_which_indPars[nm]]][, i,ds]),function(x) measure_indPars(x))
+        m_names[count] <- paste0(multp_which_indPars[nm],ds)
+      }
+    }
+  }
+}
+
+if (length(multp_which_indPars)>0){
+  m_allIndPars <- m_allIndPars[,1:count]
+  m_allIndPars <- as.data.frame(m_allIndPars)
+  m_names      <- m_names[1:count]
+  
+  allIndPars <- cbind(subjs, allIndPars,m_allIndPars)
+  colnames(allIndPars) <- c("subjid", which_indPars,m_names)
+} else {
+  allIndPars <- cbind(subjs, allIndPars)
+  colnames(allIndPars) <- c("subjid", which_indPars) 
+}
+
+
+write.csv(allIndPars,file='IndPars_fitm7c2_alone.csv',row.names = FALSE)
+
+
+etar     <- parVals$etar                 # a 60000*23 matrix
+etap     <- parVals$etap                # a 60000*23 matrix
+tau      <- parVals$tau                # a 60000*23 matrix
+etack    <- parVals$etack             # a 60000*23 matrix
+tauck    <- parVals$tauck            # a 60000*23 matrix
+fp       <- parVals$fp              # a 60000*23 matrix
+kapa1    <- parVals[['kapa']][,,1] # a 60000*23 matrix
+kapa2    <- parVals[['kapa']][,,2] # a 60000*23 matrix
+kapa3    <- parVals[['kapa']][,,3] # a 60000*23 matrix
+
+writeMat('m7c2_subwise_para_alone.mat',etar=etar,etap=etap,tau=tau,etack=etack,tauck=tauck,fp=fp,kapa1=kapa1,kapa2=kapa2,kapa3=kapa3)
+
+```
+
+
+
+
+
+
+5.7d set up model 7d, m7d_vfp
+```{r set up model 7d}
+ncore <- 3
+options(mc.cores = ncore) #adapted from hBayesDM_model.R
+rstan_options(javascript=FALSE) # see also: https://discourse.mc-stan.org/t/error-in-open-connection-con-open-mode-timeout-was-reached-github-com/23162/6
+
+
+#model 7, the rp_fg_ck model, six parameters: etar,etap,tau,etack,tauck,fp
+pars_m7d <- c("mu_etar","mu_etap","mu_tau","mu_etack","mu_tauck","mu_fp",'sigma',"etar","etap","tau","etack","tauck","fp",'log_lik')
+fit_m7d <- stan(file=paste0(getwd(),'/m7d_vfp.stan'), data=data_list,
+                             pars    = pars_m7d,
+                             chains  = 3,
+                             iter    = 4000,
+                             warmup  = 2000,
+                             thin    = 1,
+                             control = list(adapt_delta   = 0.95,
+                                            stepsize      = 1,
+                                            max_treedepth = 10))
+
+#################################################################model fit & save model & plots#############################################################
+save(fit_m7d,file='fit_m7d.RData')
+printFit(fit_m7d,ic="both")
+print(fit_m7d, pars = c("mu_etar","mu_etap","mu_tau","mu_etack","mu_tauck","mu_fp",'sigma')) #all are group-level parameters
+
+#plot group parameters
+stan_dens(fit_m7d, pars = paste0(c("mu_etar","mu_etap","mu_tau","mu_etack","mu_tauck",'mu_fp[1]','mu_fp[2]','mu_fp[3]')), separate_chains = T) #should overlap to each other
+#plot individual parameters
+stan_plot(fit_m7d, pars = "etar", ci_level = 0.95, outer_level = 1, show_density = T, point_est = "mean")
+stan_plot(fit_m7d, pars = "etap", ci_level = 0.95, outer_level = 1, show_density = T, point_est = "mean")
+stan_plot(fit_m7d, pars = "tau", ci_level = 0.95, outer_level = 1, show_density = T, point_est = "mean")
+stan_plot(fit_m7d, pars = "etack", ci_level = 0.95, outer_level = 1, show_density = T, point_est = "mean")
+stan_plot(fit_m7d, pars = "tauck", ci_level = 0.95, outer_level = 1, show_density = T, point_est = "mean")
+stan_plot(fit_m7d, pars = "fp", ci_level = 0.95, outer_level = 1, show_density = T, point_est = "mean")
+
+#################################################################model diagnostics#########################################################################
+#various plotting with bayesplot: see also https://dastatis.github.io/pdf/StanAdvent2018/bayesplot.html
+#see also: "RStan: the R interface to Stan"
+#see also: https://betanalpha.github.io/assets/case_studies/rstan_workflow.html
+###1. Convergence and divergence
+#1.1. overlaps between different chains 
+traceplot(fit_m7d, pars = c("mu_etar","mu_etap","mu_tau","mu_etack","mu_tauck","mu_fp",'sigma')) #all are group-level parameters # should be stationary and overylap to each other
+mcmc_rank_hist(fit_m7d, pars = paste0(c("mu_etar","mu_etap","mu_tau","mu_etack","mu_tauck",'mu_fp[1]','mu_fp[2]','mu_fp[3]')), ref_line = TRUE) # should be uniformly distributed
+
+#1.2. Rhat, must be below 1.01 to make sure that parameter estimates could be trusted (Baribault & Collins, 2022)
+#get the rhat values for all (including both group and individual) parameters
+rhats <- mcmc_rhat_data(rhat(fit_m7d)) # a tibble format
+stan_rhat(fit_m7d)
+#stan_rhat(fit_m7d)$data
+mcmc_rhat(rhat(fit_m7d))
+
+#1.3.energy diagnostic plot, E and deltaE should overlap each other.
+mcmc_nuts_energy(nuts_params(fit_m7d))
+
+
+
+###2. Sampling efficiency
+#2.1. for n_eff ratio, if it is less than 0.1, indicating high auto-correlation, model fitting fails
+#get the n_eff ratio values for all (including both group and individual) parameters
+neff_ratio <- mcmc_neff_data(neff_ratio(fit_m7d)) # a tibble format
+stan_ess(fit_m7d)
+mcmc_neff(neff_ratio(fit_m7d))
+
+#2.2. auto correlations, should decrease with lag (larger correlation with small lag, but smaller correlation with large lag)
+mcmc_acf(as.array(fit_m7d), pars = paste0(c("mu_etar","mu_etap","mu_tau","mu_etack","mu_tauck",'mu_fp[1]','mu_fp[2]','mu_fp[3]')),inc_warmup = F)
+
+#2.3. for total sample size, should be 4000.
+length(extract(fit_m7d, pars = "lp__")[[1]])
+
+
+
+#3. for divergent transitions, n_treedepth, accept_stat (i.e., adapt_delta parameter), stepsize, and energy
+summary(do.call(rbind,args = get_sampler_params(fit_m7d,inc_warmup = F)),digits=2) # across all chains
+lapply(get_sampler_params(fit_m7d,inc_warmup = F),summary,digits=2) # for each chain
+
+check_hmc_diagnostics(fit_m7d) # explicit checking of above parameters,including warmup transitions
+
+#4. NUTS diagnose
+stan_diag(fit_m7d)
+
+# #5. correlations of posterior samples of different parameters
+# #color_scheme_set("darkgray")
+# mcmc_pairs(
+#   as.array(fit_m7d),
+#   pars = paste0(c("mu_etar","mu_etap","mu_tau","mu_etack","mu_tauck","mu_fp")), 
+#   np = nuts_params(fit_m7d))
+
+
+```
+
+
+5.7e set up model 7e,m7e_vckLR
+```{r set up model 7e}
+ncore <- 3
+options(mc.cores = ncore) #adapted from hBayesDM_model.R
+rstan_options(javascript=FALSE) # see also: https://discourse.mc-stan.org/t/error-in-open-connection-con-open-mode-timeout-was-reached-github-com/23162/6
+
+
+#model 7, the rp_fg_ck model, six parameters: etar,etap,tau,etack,tauck,fp
+pars_m7e <- c("mu_etar","mu_etap","mu_tau","mu_etack","mu_tauck","mu_fp",'sigma',"etar","etap","tau","etack","tauck","fp",'log_lik')
+fit_m7e <- stan(file=paste0(getwd(),'/m7e_vckLR.stan'), data=data_list,
+                             pars    = pars_m7e,
+                             chains  = 3,
+                             iter    = 4000,
+                             warmup  = 2000,
+                             thin    = 1,
+                             control = list(adapt_delta   = 0.95,
+                                            stepsize      = 1,
+                                            max_treedepth = 10))
+
+#################################################################model fit & save model & plots#############################################################
+save(fit_m7e,file='fit_m7e.RData')
+printFit(fit_m7e,ic="both")
+print(fit_m7e, pars = c("mu_etar","mu_etap","mu_tau","mu_etack","mu_tauck","mu_fp",'sigma')) #all are group-level parameters
+
+#plot group parameters
+stan_dens(fit_m7e, pars = paste0(c("mu_etar","mu_etap","mu_tau","mu_etack[1]","mu_etack[2]","mu_etack[3]","mu_tauck","mu_fp")), separate_chains = T) #should overlap to each other
+#plot individual parameters
+stan_plot(fit_m7e, pars = "etar", ci_level = 0.95, outer_level = 1, show_density = T, point_est = "mean")
+stan_plot(fit_m7e, pars = "etap", ci_level = 0.95, outer_level = 1, show_density = T, point_est = "mean")
+stan_plot(fit_m7e, pars = "tau", ci_level = 0.95, outer_level = 1, show_density = T, point_est = "mean")
+stan_plot(fit_m7e, pars = "etack", ci_level = 0.95, outer_level = 1, show_density = T, point_est = "mean")
+stan_plot(fit_m7e, pars = "tauck", ci_level = 0.95, outer_level = 1, show_density = T, point_est = "mean")
+stan_plot(fit_m7e, pars = "fp", ci_level = 0.95, outer_level = 1, show_density = T, point_est = "mean")
+
+#################################################################model diagnostics#########################################################################
+#various plotting with bayesplot: see also https://dastatis.github.io/pdf/StanAdvent2018/bayesplot.html
+#see also: "RStan: the R interface to Stan"
+#see also: https://betanalpha.github.io/assets/case_studies/rstan_workflow.html
+###1. Convergence and divergence
+#1.1. overlaps between different chains 
+traceplot(fit_m7e, pars = c("mu_etar","mu_etap","mu_tau","mu_etack","mu_tauck","mu_fp",'sigma')) #all are group-level parameters # should be stationary and overylap to each other
+mcmc_rank_hist(fit_m7e, pars = paste0(c("mu_etar","mu_etap","mu_tau","mu_etack[1]","mu_etack[2]","mu_etack[3]","mu_tauck","mu_fp")), ref_line = TRUE) # should be uniformly distributed
+
+#1.2. Rhat, must be below 1.01 to make sure that parameter estimates could be trusted (Baribault & Collins, 2022)
+#get the rhat values for all (including both group and individual) parameters
+rhats <- mcmc_rhat_data(rhat(fit_m7e)) # a tibble format
+stan_rhat(fit_m7e)
+#stan_rhat(fit_m7e)$data
+mcmc_rhat(rhat(fit_m7e))
+
+#1.3.energy diagnostic plot, E and deltaE should overlap each other.
+mcmc_nuts_energy(nuts_params(fit_m7e))
+
+
+
+###2. Sampling efficiency
+#2.1. for n_eff ratio, if it is less than 0.1, indicating high auto-correlation, model fitting fails
+#get the n_eff ratio values for all (including both group and individual) parameters
+neff_ratio <- mcmc_neff_data(neff_ratio(fit_m7e)) # a tibble format
+stan_ess(fit_m7e)
+mcmc_neff(neff_ratio(fit_m7e))
+
+#2.2. auto correlations, should decrease with lag (larger correlation with small lag, but smaller correlation with large lag)
+mcmc_acf(as.array(fit_m7e), pars = paste0(c("mu_etar","mu_etap","mu_tau","mu_etack[1]","mu_etack[2]","mu_etack[3]","mu_tauck","mu_fp")),inc_warmup = F)
+
+#2.3. for total sample size, should be 4000.
+length(extract(fit_m7e, pars = "lp__")[[1]])
+
+
+
+#3. for divergent transitions, n_treedepth, accept_stat (i.e., adapt_delta parameter), stepsize, and energy
+summary(do.call(rbind,args = get_sampler_params(fit_m7e,inc_warmup = F)),digits=2) # across all chains
+lapply(get_sampler_params(fit_m7e,inc_warmup = F),summary,digits=2) # for each chain
+
+check_hmc_diagnostics(fit_m7e) # explicit checking of above parameters,including warmup transitions
+
+#4. NUTS diagnose
+stan_diag(fit_m7e)
+
+# #5. correlations of posterior samples of different parameters
+# #color_scheme_set("darkgray")
+# mcmc_pairs(
+#   as.array(fit_m7e),
+#   pars = paste0(c("mu_etar","mu_etap","mu_tau","mu_etack","mu_tauck","mu_fp")), 
+#   np = nuts_params(fit_m7e))
+
+
+```
+
+
+5.7f set up model 7f, m7f_vIT
+```{r set up model 7f}
+ncore <- 3
+options(mc.cores = ncore) #adapted from hBayesDM_model.R
+rstan_options(javascript=FALSE) # see also: https://discourse.mc-stan.org/t/error-in-open-connection-con-open-mode-timeout-was-reached-github-com/23162/6
+
+
+#model 7, the rp_fg_ck model, six parameters: etar,etap,tau,etack,tauck,fp
+pars_m7f <- c("mu_etar","mu_etap","mu_tau","mu_etack","mu_tauck","mu_fp",'sigma',"etar","etap","tau","etack","tauck","fp",'log_lik')
+fit_m7f <- stan(file=paste0(getwd(),'/m7f_vIT.stan'), data=data_list,
+                             pars    = pars_m7f,
+                             chains  = 3,
+                             iter    = 4000,
+                             warmup  = 2000,
+                             thin    = 1,
+                             control = list(adapt_delta   = 0.95,
+                                            stepsize      = 1,
+                                            max_treedepth = 10))
+
+#################################################################model fit & save model & plots#############################################################
+save(fit_m7f,file='fit_m7f.RData')
+printFit(fit_m7f,ic="both")
+print(fit_m7f, pars = c("mu_etar","mu_etap","mu_tau","mu_etack","mu_tauck","mu_fp",'sigma')) #all are group-level parameters
+
+#plot group parameters
+stan_dens(fit_m7f, pars = paste0(c("mu_etar","mu_etap","mu_tau[1]","mu_tau[2]","mu_tau[3]","mu_etack","mu_tauck","mu_fp")), separate_chains = T) #should overlap to each other
+#plot individual parameters
+stan_plot(fit_m7f, pars = "etar", ci_level = 0.95, outer_level = 1, show_density = T, point_est = "mean")
+stan_plot(fit_m7f, pars = "etap", ci_level = 0.95, outer_level = 1, show_density = T, point_est = "mean")
+stan_plot(fit_m7f, pars = "tau", ci_level = 0.95, outer_level = 1, show_density = T, point_est = "mean")
+stan_plot(fit_m7f, pars = "etack", ci_level = 0.95, outer_level = 1, show_density = T, point_est = "mean")
+stan_plot(fit_m7f, pars = "tauck", ci_level = 0.95, outer_level = 1, show_density = T, point_est = "mean")
+stan_plot(fit_m7f, pars = "fp", ci_level = 0.95, outer_level = 1, show_density = T, point_est = "mean")
+
+#################################################################model diagnostics#########################################################################
+#various plotting with bayesplot: see also https://dastatis.github.io/pdf/StanAdvent2018/bayesplot.html
+#see also: "RStan: the R interface to Stan"
+#see also: https://betanalpha.github.io/assets/case_studies/rstan_workflow.html
+###1. Convergence and divergence
+#1.1. overlaps between different chains 
+traceplot(fit_m7f, pars = c("mu_etar","mu_etap","mu_tau","mu_etack","mu_tauck","mu_fp",'sigma')) #all are group-level parameters # should be stationary and overylap to each other
+mcmc_rank_hist(fit_m7f, pars = paste0(c("mu_etar","mu_etap","mu_tau[1]","mu_tau[2]","mu_tau[3]","mu_etack","mu_tauck","mu_fp")), ref_line = TRUE) # should be uniformly distributed
+
+#1.2. Rhat, must be below 1.01 to make sure that parameter estimates could be trusted (Baribault & Collins, 2022)
+#get the rhat values for all (including both group and individual) parameters
+rhats <- mcmc_rhat_data(rhat(fit_m7f)) # a tibble format
+stan_rhat(fit_m7f)
+#stan_rhat(fit_m7f)$data
+mcmc_rhat(rhat(fit_m7f))
+
+#1.3.energy diagnostic plot, E and deltaE should overlap each other.
+mcmc_nuts_energy(nuts_params(fit_m7f))
+
+
+
+###2. Sampling efficiency
+#2.1. for n_eff ratio, if it is less than 0.1, indicating high auto-correlation, model fitting fails
+#get the n_eff ratio values for all (including both group and individual) parameters
+neff_ratio <- mcmc_neff_data(neff_ratio(fit_m7f)) # a tibble format
+stan_ess(fit_m7f)
+mcmc_neff(neff_ratio(fit_m7f))
+
+#2.2. auto correlations, should decrease with lag (larger correlation with small lag, but smaller correlation with large lag)
+mcmc_acf(as.array(fit_m7f), pars = paste0(c("mu_etar","mu_etap","mu_tau[1]","mu_tau[2]","mu_tau[3]","mu_etack","mu_tauck","mu_fp")),inc_warmup = F)
+
+#2.3. for total sample size, should be 4000.
+length(extract(fit_m7f, pars = "lp__")[[1]])
+
+
+
+#3. for divergent transitions, n_treedepth, accept_stat (i.e., adapt_delta parameter), stepsize, and energy
+summary(do.call(rbind,args = get_sampler_params(fit_m7f,inc_warmup = F)),digits=2) # across all chains
+lapply(get_sampler_params(fit_m7f,inc_warmup = F),summary,digits=2) # for each chain
+
+check_hmc_diagnostics(fit_m7f) # explicit checking of above parameters,including warmup transitions
+
+#4. NUTS diagnose
+stan_diag(fit_m7f)
+
+# #5. correlations of posterior samples of different parameters
+# #color_scheme_set("darkgray")
+# mcmc_pairs(
+#   as.array(fit_m7f),
+#   pars = paste0(c("mu_etar","mu_etap","mu_tau","mu_etack","mu_tauck","mu_fp")), 
+#   np = nuts_params(fit_m7f))
+
+
+```
+
+
+5.7g set up model 7g, m7g_vckIT
+```{r set up model 7g}
+ncore <- 3
+options(mc.cores = ncore) #adapted from hBayesDM_model.R
+rstan_options(javascript=FALSE) # see also: https://discourse.mc-stan.org/t/error-in-open-connection-con-open-mode-timeout-was-reached-github-com/23162/6
+
+
+#model 7, the rp_fg_ck model, six parameters: etar,etap,tau,etack,tauck,fp
+pars_m7g <- c("mu_etar","mu_etap","mu_tau","mu_etack","mu_tauck","mu_fp",'sigma',"etar","etap","tau","etack","tauck","fp",'log_lik')
+fit_m7g <- stan(file=paste0(getwd(),'/m7g_vckIT.stan'), data=data_list,
+                             pars    = pars_m7g,
+                             chains  = 3,
+                             iter    = 4000,
+                             warmup  = 2000,
+                             thin    = 1,
+                             control = list(adapt_delta   = 0.95,
+                                            stepsize      = 1,
+                                            max_treedepth = 10))
+
+#################################################################model fit & save model & plots#############################################################
+save(fit_m7g,file='fit_m7g.RData')
+printFit(fit_m7g,ic="both")
+print(fit_m7g, pars = c("mu_etar","mu_etap","mu_tau","mu_etack","mu_tauck","mu_fp",'sigma')) #all are group-level parameters
+
+#plot group parameters
+stan_dens(fit_m7g, pars = paste0(c("mu_etar","mu_etap","mu_tau","mu_etack","mu_tauck[1]","mu_tauck[2]","mu_tauck[3]","mu_fp")), separate_chains = T) #should overlap to each other
+#plot individual parameters
+stan_plot(fit_m7g, pars = "etar", ci_level = 0.95, outer_level = 1, show_density = T, point_est = "mean")
+stan_plot(fit_m7g, pars = "etap", ci_level = 0.95, outer_level = 1, show_density = T, point_est = "mean")
+stan_plot(fit_m7g, pars = "tau", ci_level = 0.95, outer_level = 1, show_density = T, point_est = "mean")
+stan_plot(fit_m7g, pars = "etack", ci_level = 0.95, outer_level = 1, show_density = T, point_est = "mean")
+stan_plot(fit_m7g, pars = "tauck", ci_level = 0.95, outer_level = 1, show_density = T, point_est = "mean")
+stan_plot(fit_m7g, pars = "fp", ci_level = 0.95, outer_level = 1, show_density = T, point_est = "mean")
+
+#################################################################model diagnostics#########################################################################
+#various plotting with bayesplot: see also https://dastatis.github.io/pdf/StanAdvent2018/bayesplot.html
+#see also: "RStan: the R interface to Stan"
+#see also: https://betanalpha.github.io/assets/case_studies/rstan_workflow.html
+###1. Convergence and divergence
+#1.1. overlaps between different chains 
+traceplot(fit_m7g, pars = c("mu_etar","mu_etap","mu_tau","mu_etack","mu_tauck","mu_fp",'sigma')) #all are group-level parameters # should be stationary and overylap to each other
+mcmc_rank_hist(fit_m7g, pars = paste0(c("mu_etar","mu_etap","mu_tau","mu_etack","mu_tauck[1]","mu_tauck[2]","mu_tauck[3]","mu_fp")), ref_line = TRUE) # should be uniformly distributed
+
+#1.2. Rhat, must be below 1.01 to make sure that parameter estimates could be trusted (Baribault & Collins, 2022)
+#get the rhat values for all (including both group and individual) parameters
+rhats <- mcmc_rhat_data(rhat(fit_m7g)) # a tibble format
+stan_rhat(fit_m7g)
+#stan_rhat(fit_m7g)$data
+mcmc_rhat(rhat(fit_m7g))
+
+#1.3.energy diagnostic plot, E and deltaE should overlap each other.
+mcmc_nuts_energy(nuts_params(fit_m7g))
+
+
+
+###2. Sampling efficiency
+#2.1. for n_eff ratio, if it is less than 0.1, indicating high auto-correlation, model fitting fails
+#get the n_eff ratio values for all (including both group and individual) parameters
+neff_ratio <- mcmc_neff_data(neff_ratio(fit_m7g)) # a tibble format
+stan_ess(fit_m7g)
+mcmc_neff(neff_ratio(fit_m7g))
+
+#2.2. auto correlations, should decrease with lag (larger correlation with small lag, but smaller correlation with large lag)
+mcmc_acf(as.array(fit_m7g), pars = paste0(c("mu_etar","mu_etap","mu_tau","mu_etack","mu_tauck[1]","mu_tauck[2]","mu_tauck[3]","mu_fp")),inc_warmup = F)
+
+#2.3. for total sample size, should be 4000.
+length(extract(fit_m7g, pars = "lp__")[[1]])
+
+
+
+#3. for divergent transitions, n_treedepth, accept_stat (i.e., adapt_delta parameter), stepsize, and energy
+summary(do.call(rbind,args = get_sampler_params(fit_m7g,inc_warmup = F)),digits=2) # across all chains
+lapply(get_sampler_params(fit_m7g,inc_warmup = F),summary,digits=2) # for each chain
+
+check_hmc_diagnostics(fit_m7g) # explicit checking of above parameters,including warmup transitions
+
+#4. NUTS diagnose
+stan_diag(fit_m7g)
+
+# #5. correlations of posterior samples of different parameters
+# #color_scheme_set("darkgray")
+# mcmc_pairs(
+#   as.array(fit_m7g),
+#   pars = paste0(c("mu_etar","mu_etap","mu_tau","mu_etack","mu_tauck","mu_fp")), 
+#   np = nuts_params(fit_m7g))
+
+
+```
+
