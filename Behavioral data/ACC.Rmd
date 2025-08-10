@@ -1,0 +1,390 @@
+---
+title: "Learning_GLMM"
+author: "Chunliang Feng (SCNU)"
+date: June 21, 2022
+output:
+  html_document:
+    code_folding: hide
+---
+
+```{r setup, include=FALSE}
+#rm(list=ls())
+require("knitr") 
+opts_chunk$set(tidy = FALSE, warning = FALSE, message = FALSE, cache = FALSE)
+
+#load libraries
+suppressMessages(library("tidyverse")) # to organize data
+suppressMessages(library("afex"))  # using 'all_fit' to find appropriate optimizer; and 'mixed' for significance test
+suppressMessages(library("lme4"))  # to fit data with mixed models
+suppressMessages(library("emmeans"))  # emmeans is needed for follow-up tests 
+suppressMessages(library("multcomp")) # for advanced control for multiple testing/Type 1 errors. using 'update' for post-hoc comp
+suppressMessages(library("ggeffects")) # for plotting (G)LMM results
+suppressMessages(library('car')) # setting labeled contrasts
+suppressMessages(library("ggplot2")) # for plotting
+suppressMessages(library("ggsci")) # for setting scientific journal color palettes 
+suppressMessages(library("gridExtra")) # for arranging the position of figures
+suppressMessages(library("ggpubr")) # using the ggexport
+suppressMessages(library("sjPlot")) # using the plot_model, to show random and fixed effects.
+suppressMessages(library("glmmTMB")) #required by plot_model when plotting random effects
+suppressMessages(library("performance")) # model assumptions & performance, to use check_model for model assumptions
+suppressMessages(library("RePsychLing")) #using the rePCA to determine redundant random effects
+suppressMessages(library("ggthemes"))#provide theme for plot
+
+select <- dplyr::select # to avoid clashes with the MASS package, i.e., using 'select' function in the 'dplyr' package
+
+
+```
+
+0. Task description
+```{r task description}
+# In this task, 47 participants completed 5 blocks of reinforcement learning task in two social contexts: alone or the presence of others (as denoted by the variable 'appearance'). 
+
+# Each block consisted of 6 new and distinct pictures in 3 feedback validity (as denoted by variable 'prob' or 'prob2'): 100%, 80%, and 52%. In particular, one picture was 100% associated with left key, one was 100% associated with right key. Likewise, two pictures were respectively 80% associated with left and right keys. Finally, two pictures were respectively 52% associated with left and right keys. Each block was split into two bins (as denoted by the variable 'bin'), that is, early or late learning stage 
+
+# On each trial, participants were asked to respond with left or right key at the presence of a given picture. Their response was followed with a feedback according to participant's response and feedback validity. Therefore, participants could improve their choice according to choice and outcome in a trial-and-error manner.
+
+# More details on the task and data analysis could be found in the 'Task design and Data analysis.docx' file or the following reference:
+#Eppinger, B., Kray, J., Mock, B., & Mecklinger, A. (2008). Better or worse than expected? Aging, learning, and the ERN. Neuropsychologia, 46(2), 521-539.
+
+# This analysis focused on participant's accuracy (as denoted by variable 'ACC'). A GLMM was constructed as detailed below. In particular, we asked the question of whether participant's accuracy was modulated by experimental factors manipulated in the current study, that is, social context (appearance), feedback validity (prob2) and learning stage (bin).
+
+
+```
+
+
+1. load data
+```{r loaddata}
+raw_data                     <- read.csv(file="all_data.csv",head=TRUE)
+data_df                      <- raw_data
+
+```
+
+2.0 data descriptions
+```{r data descriptions}
+#the following key variables are relevant to the current analysis
+#DV: ACC.
+#IV: 1. appearance(bs,0=alone;1=other);prob2(1=high;2=medium;3=low);3. bin(1=early stage,2=late stage).
+#random effect: subid
+```
+
+2.1 data cleaning
+```{r data cleaning}
+#1.remove NaNs
+data_df        <- data_df %>% filter(!is.na(ACC)) #excluding non-response trials and NaNs
+
+data_df$subid                <- factor(data_df$subid)
+data_df$appearance           <- factor(data_df$appearance)
+data_df$prob                 <- factor(data_df$prob)
+data_df                      <- data_df %>% mutate(prob2 = as.factor(ifelse(prob == "1",'High',ifelse(prob == "2",'Medium','Low')))) #transfer numbers to string
+data_df$prob2                <- factor(data_df$prob2,levels=c('High','Medium','Low')) #reorder the levels; prob2 was computed to avoid errors in emmeans package.
+data_df$bin                  <- factor(data_df$bin)
+
+#distribution of the data
+hist(data_df$ACC)
+
+```
+
+2.2 describing data
+```{r desrciping data}
+####################################################1. how many subjects remained##################################################################
+data_df %>% group_by(subid) %>% summarize() %>% nrow()
+
+###############################################2. how many trials left for each cell###########################################################
+tn <- data_df %>% group_by(subid,prob,bin) %>% summarize(trialn=length(subid)) %>% ungroup()
+min(tn$trialn)# check if any condition has too few trials
+
+##############################################3. check the levels of the factors####################################################################
+levels(data_df$appearance)
+levels(data_df$prob)
+levels(data_df$prob2)
+levels(data_df$bin)
+
+```
+
+2.3 re-coding and scaling predictors
+```{r recoding and scaling}
+#
+######################################################1. re-coding categorical predictors###################################################
+contrasts(data_df$appearance)                <- contr.Sum(levels(data_df$appearance)) # must be Sum instead of sum
+contrasts(data_df$prob)                      <- contr.Sum(levels(data_df$prob))
+contrasts(data_df$prob2)                     <- contr.Sum(levels(data_df$prob2))
+contrasts(data_df$bin)                       <- contr.Sum(levels(data_df$bin))
+
+#check the new coding approach
+contrasts(data_df$appearance)
+contrasts(data_df$prob)
+contrasts(data_df$prob2)
+contrasts(data_df$bin)
+
+```
+
+
+3.1. fit a full model
+```{r full model}
+m1.full <- glmer(ACC ~ 1 + appearance * prob2 * bin + (1 + prob2 * bin | subid), data=data_df, family="binomial",control = glmerControl(optimizer = 'bobyqa',calc.derivs = F,optCtrl = list(maxfun = 2e5)))
+save(m1.full, file = "m1_full_ACC.RData")
+summary(m1.full)
+
+```
+
+```{r rePCA1}
+summary(rePCA(m1.full)) # to see how many random effects are needed. It seems 5 is good enough, not the full 6.
+
+model_terms <- model.matrix(m1.full)  ### Please, pease check the model_terms very very carfully. #see also:  https://rpubs.com/Reinhold/22193 and https://rpubs.com/yjunechoe/correlationsLMEM
+
+p_name   <- colnames(model.matrix(m1.full)) 
+par_info <- data.frame('number'=c(1:length(p_name)),'names'=p_name)  # must check the column names and get the right column!!! very very important.
+
+```
+
+3.2. fit a reduced model with 5 REs, eliminating higher-order REs first, including REs with larger variance.
+```{r 5res model}
+
+
+re_p1          <- model.matrix(m1.full)[,3] # random effects of prob1
+re_p2          <- model.matrix(m1.full)[,4] # random effects of prob2
+re_t           <- model.matrix(m1.full)[,5] # random effects of bin
+re_p1t         <- model.matrix(m1.full)[,9] # random effects of prob1*bin
+re_p2t         <- model.matrix(m1.full)[,10] # random effects of prob2*bin
+
+
+
+m1.5res   <- glmer(ACC ~ 1 + appearance * prob2 * bin + 
+                    (1 + re_p1 + re_p2 + re_t + re_p2t | subid), 
+                  data=data_df, family="binomial",control = glmerControl(optimizer = 'bobyqa',calc.derivs = F,optCtrl = list(maxfun = 2e5)))
+
+save(m1.5res, file = "m1_5res_ACC.RData")
+summary(m1.5res)
+
+
+
+### below is quite important to make sure that the random effects extracted above are correct!!!! It should generate the same results with the original model
+#m1.test   <- glmer(ACC ~ 1 + appearance * prob2 * bin + 
+#                    (1 + re_p1 + re_p2 + re_t + re_p1t + re_p2t | subid), 
+#                  data=data_df, family="binomial",control = glmerControl(optimizer = 'bobyqa',calc.derivs = F,optCtrl = list(maxfun = 2e5)))
+
+#summary(m1.test)
+
+```
+
+```{r rePCA2}
+summary(rePCA(m1.5res)) # to see how many random effects are needed. It seems that 5 is good enough
+anova(m1.5res, m1.full,refit=F)
+
+```
+
+3.4. fit a zero-correlation-parameter (zcp) model, to see if it works equally well with the model with correlated REs.
+```{r zcp model}
+m1.5res.zcp   <- glmer(ACC ~ 1 + appearance * prob2 * bin + 
+                      (1 | subid) + (0 + re_p1 | subid) + (0 + re_p2 | subid) + (0 + re_t | subid) + (0 + re_p2t | subid), 
+                  data=data_df, family="binomial",control = glmerControl(optimizer = 'bobyqa',calc.derivs = F,optCtrl = list(maxfun = 2e5)))
+
+save(m1.5res.zcp, file = "m1_5res_zcp_ACC.RData")
+summary(m1.5res.zcp)
+
+```
+
+
+
+```{r rePCA5}
+summary(rePCA(m1.5res.zcp)) # to see how many random effects are needed. It seems 5 is good enough.
+anova(m1.5res.zcp, m1.5res,refit=F)#When comparing model with different random effects, REML should be used, so automatic refits to ML method are rejected
+```
+the result suggests that we really need the correlation parameters
+
+
+
+3.5. iteratively remove one REs, and test if it reduces the model fit.
+```{r remove nonsig REs}
+
+m1.5res_redu1   <- glmer(ACC ~ 1 + appearance * prob2 * bin + 
+                    (0 + re_p1 + re_p2 + re_t + re_p2t | subid), 
+                  data=data_df, family="binomial",control = glmerControl(optimizer = 'bobyqa',calc.derivs = F,optCtrl = list(maxfun = 2e5)))
+
+m1.5res_redu2   <- glmer(ACC ~ 1 + appearance * prob2 * bin + 
+                    (1 + re_p2 + re_t + re_p2t | subid), 
+                  data=data_df, family="binomial",control = glmerControl(optimizer = 'bobyqa',calc.derivs = F,optCtrl = list(maxfun = 2e5)))
+
+m1.5res_redu3   <- glmer(ACC ~ 1 + appearance * prob2 * bin + 
+                    (1 + re_p1 + re_t + re_p2t | subid), 
+                  data=data_df, family="binomial",control = glmerControl(optimizer = 'bobyqa',calc.derivs = F,optCtrl = list(maxfun = 2e5)))
+
+m1.5res_redu4   <- glmer(ACC ~ 1 + appearance * prob2 * bin + 
+                    (1 + re_p1 + re_p2 + re_p2t | subid), 
+                  data=data_df, family="binomial",control = glmerControl(optimizer = 'bobyqa',calc.derivs = F,optCtrl = list(maxfun = 2e5)))
+
+m1.5res_redu5   <- glmer(ACC ~ 1 + appearance * prob2 * bin + 
+                    (1 + re_p1 + re_p2 + re_t | subid), 
+                  data=data_df, family="binomial",control = glmerControl(optimizer = 'bobyqa',calc.derivs = F,optCtrl = list(maxfun = 2e5)))
+
+
+
+
+anova(m1.5res_redu1, m1.5res,refit=F)
+anova(m1.5res_redu2, m1.5res,refit=F)
+anova(m1.5res_redu3, m1.5res,refit=F)
+anova(m1.5res_redu4, m1.5res,refit=F)
+anova(m1.5res_redu5, m1.5res,refit=F)
+
+
+save(m1.5res_redu1,m1.5res_redu2,m1.5res_redu3,m1.5res_redu4, file = "m1_5res_allreduced_ACC.RData")
+
+```
+
+So, m1.5res will be the identified model.However, if the zcp model was selected in the previous step, and here a new model(which minus a random effect) was adopted in the iterative comparison , the correction parameters need to be added back for comparison
+
+4. significance test with fixed model.
+```{r sig test}
+#The reduced model should be the same as the full model in terms of random effects and control parameters etc.
+#That is, everything else except the interested effect should be the same between full and reduced models.
+
+
+acc.sig <- mixed(ACC ~ 1 + appearance * prob2 * bin + 
+                    (1 + re_p1 + re_p2 + re_t + re_p2t | subid), 
+                  data=data_df, family="binomial",method='LRT', # could be 'PB'
+                       check_contrasts = F,control = glmerControl(optimizer = 'bobyqa',calc.derivs = F,optCtrl = list(maxfun = 2e5)))
+
+acc.sig
+
+save(acc.sig, file = "acc_sig.RData")
+
+```
+
+5. post-hoc comparisons
+```{r post-hoc comparisons}
+#https://cran.r-project.org/web/packages/afex/vignettes/afex_mixed_example.html
+#https://zhuanlan.zhihu.com/p/63092231?utm_source=wechat_session&utm_medium=social&utm_oi=669244116261539840&s_r=0
+#https://cran.r-project.org/web/packages/emmeans/vignettes/interactions.html
+load('m1_5res_ACC.RData')
+###########################################################for ACC######################################################################
+#a simple plot of the factors
+emmip(m1.5res, appearance ~ bin | prob2) #just for simple plotting
+
+#1. for the main effect of appearance or prob2
+emm_acc.main.app <- emmeans(m1.5res, c("appearance"),type="response")
+emm_acc.main.app
+update(pairs(emm_acc.main.app), by = NULL, adjust = "holm") # using the FDR corrections here
+
+emm_acc.main.bin <- emmeans(m1.5res, c("bin"),type="response")
+emm_acc.main.bin
+update(pairs(emm_acc.main.bin), by = NULL, adjust = "holm") # using the FDR corrections here
+
+emm_acc.main.prob2 <- emmeans(m1.5res, c("prob2"),type="response")
+emm_acc.main.prob2
+update(pairs(emm_acc.main.prob2), by = NULL, adjust = "holm") # using the FDR corrections here
+
+
+#2. for the two-way interaction of bin:prob2
+emm_acc.int2 <- emmeans(m1.5res, "bin", by = "prob2",type="response")
+emm_acc.int2
+update(pairs(emm_acc.int2), by = NULL, adjust = "holm") # using the FDR corrections here
+
+#3. for the three-way interaction of appearance:bin:prob2
+#emm_acc.int3 <- emmeans(m1.5res, ~appearance | prob2,by='bin') # the other two post-hoc comparisons are of no interest
+emm_acc.int3 <- emmeans(m1.5res, ~appearance | prob2*bin,type="response") #same as above
+emm_acc.int3
+update(pairs(emm_acc.int3), by = NULL, adjust = "none") # using the FDR corrections here, could be "none" for uncorrected results
+update(pairs(emm_acc.int3), by = NULL, adjust = "holm") # using the FDR corrections here, could be "none" for uncorrected results
+update(pairs(emm_acc.int3, reverse = TRUE), by = NULL, adjust = "holm") # for social vs. alone
+
+emm_acc.int32 <- emmeans(m1.5res, ~bin | prob2*appearance,type="response") #same as above
+emm_acc.int32
+update(pairs(emm_acc.int32), by = NULL, adjust = "holm") # using the FDR corrections here, could be "none" for uncorrected results
+
+```
+
+
+6. model diagnoses
+```{r model diagnoses,, fig.height = 6, fig.width = 10}
+
+##########################################4. check out random effects and plot them##############################################
+cfs <- coef(m1.5res)
+var(cfs$subid$re_p1) ## to calculate the variance of random effects (should NOT be 0), just as an example here, can do for others
+var(cfs$subid$`appearance[S.0]`) ## to calculate the variance of fixed effects (should be 0), just as an example here, can do for others
+
+#plot with the plot_model:http://www.strengejacke.de/sjPlot/reference/plot_model.html
+#fixed effects,the same as summary funnction, should be careful, the interpretation of these effects depends on your coding scheme!!!
+#plot_model(m1.rt)+ ylim(-.05, .05) #see also https://github.com/strengejacke/sjPlot/issues/440
+plot_model(m1.5res)
+
+#random effects
+acc.re  <- plot_model(m1.5res, type = "re", grid=FALSE)
+
+grid.arrange(acc.re[[1]],acc.re[[2]],acc.re[[3]],acc.re[[4]],acc.re[[5]],nrow=2,ncol=3)
+
+
+
+```
+
+
+7. plotting results
+```{r plotting results}
+#https://stackoverflow.com/questions/69948052/plot-generalized-linear-mixed-models-glmms-mixture-of-categorical-and-numeric
+#https://strengejacke.github.io/ggeffects/articles/practical_logisticmixedmodel.html
+# see also ggeffect manual
+load("m1_5res_ACC.RData")
+
+############Using Custom Function#####################
+#When the aesthetic scheme is determined, the custom functions helps to plot different data more easily
+#You can flexibly decide the input of your function according to your own needs(The input is the parameter you may want to modify)
+
+windowsFonts(N=windowsFont("Times New Roman"),A=windowsFont("Arial")) #Custom Fonts
+pd <- position_dodge(0.1) #https://stackoverflow.com/questions/39533456/how-to-jitter-both-geom-line-and-geom-point-by-the-same-magnitude
+
+effectplot <- function(d,ylimits,ybreaks,ylabs){
+  fig <- ggplot(d, aes(x=x_lab, y=predicted,group=group_lab,color = group_lab,fill=group_lab)) +
+    geom_line(linetype = "dashed",size=1,position = pd) +  # in the mydf, 'group' refer to 'appearance'
+    geom_pointrange(aes(ymin=conf.low, ymax=conf.high), shape=21, fatten = 5, size = 1.5,position = pd)+ 
+    #The adjustment of line size is replaced by 'linewidth' in the new version of ggplot
+    scale_y_continuous(limits = ylimits,breaks = ybreaks,expand = c(0, 0))+ 
+    #https://stackoverflow.com/questions/13701347/force-the-origin-to-start-at-0
+    labs(x = "Learning Stage", y = ylabs)+
+    #scale_color_lancet()+ #https://cran.r-project.org/web/packages/ggsci/vignettes/ggsci.html
+    #scale_fill_lancet()+
+    scale_colour_manual(values=c('#4DBBD6','#039F87'),name='Context')+ 
+    scale_fill_manual(values=c('#4DBBD6','#039F87'),name='Context')+
+    theme_classic()+
+    theme(legend.position="top",
+          legend.title = element_text(size=20,colour='black',family="A"),
+          legend.text = element_text(size=20,colour='black',family="A"),
+          axis.ticks.length = unit(0.1, "cm"),
+          axis.text.x = element_text(size=20,colour='black',family="A"),
+          axis.text.y = element_text(size=20,colour='black',family="A"),
+          axis.title= element_text(size=24,colour='black',family="A"))
+}
+
+
+
+################################################################### generating the marginal effects####################################################
+mydf <- ggemmeans(m1.5res, terms = c("bin", "appearance","prob2")) #using ggemmeans instead of ggpredict for consistent results with post-hoc comparisons
+#we will plot the interaction of bin * appearance interaction, for each level of prob2 separately
+mydf.sure   <- mydf[mydf$facet=='High',]
+mydf.pro    <- mydf[mydf$facet=='Medium',]
+mydf.rand   <- mydf[mydf$facet=='Low',]
+
+min(mydf$conf.low)
+max(mydf$conf.high)
+
+
+mydf.sure <- mydf.sure %>% mutate(x_lab = as.factor(ifelse(x == "1",'Early','Late')))
+mydf.sure <- mydf.sure %>% mutate(group_lab = as.factor(ifelse(group == "0",'Alone','Audience')))
+FigA <- effectplot(mydf.sure,c(0.4,0.9),seq(from=0.4,to=0.9,by=0.1),ylabs='ACC (high validity)')
+FigA
+
+
+mydf.pro <- mydf.pro %>% mutate(x_lab = as.factor(ifelse(x == "1",'Early','Late')))
+mydf.pro <- mydf.pro %>% mutate(group_lab = as.factor(ifelse(group == "0",'Alone','Audience')))
+FigB <- effectplot(mydf.pro,c(0.4,0.9),seq(from=0.4,to=0.9,by=0.1),ylabs='ACC (medium validity)')
+FigB
+
+mydf.rand <- mydf.rand %>% mutate(x_lab = as.factor(ifelse(x == "1",'Early','Late')))
+mydf.rand <- mydf.rand %>% mutate(group_lab = as.factor(ifelse(group == "0",'Alone','Audience')))
+FigC <- effectplot(mydf.rand,c(0.4,0.9),seq(from=0.4,to=0.9,by=0.1),ylabs='ACC (low validity)')
+FigC
+
+ggsave(FigA,filename = "Figure_ACCC_sure.png",width=2400,height=1600,dpi  = 300,units = "px")
+ggsave(FigB,filename = "Figure_ACCC_pro.png",width=2400,height=1600,dpi = 300,units = "px")
+ggsave(FigC,filename = "Figure_ACCC_rand.png",width=2400,height=1600,dpi = 300,units = "px")
+
+
+```
